@@ -172,6 +172,23 @@ def parse_workbook(filepath: Path, debug: bool = False):
             current_q = None
             current_sq = None
 
+        def attach_side_answer(r, sq) -> str | None:
+            """Find a side-answer dropdown on row `r` (cols B–K) and attach to
+            `sq`. Returns the cell ref if attached, else None."""
+            if sq is None:
+                return None
+            for col in range(CONTENT_START_COL, SIDE_ANS_END_COL + 1):
+                if (r, col) not in dropdowns:
+                    continue
+                val = effective_value(ws, r, col, merged)
+                if not val:
+                    continue
+                sq.side_answer         = str(val).strip()
+                sq.side_answer_options = dropdowns[(r, col)]
+                sq.side_answer_cell    = f"{get_column_letter(col)}{r}"
+                return sq.side_answer_cell
+            return None
+
         for row in range(1, ws.max_row + 1):
             # Collect cells in the content range. Include cells with text OR with an
             # "answer fill" (grey/yellow) even if empty — those are empty answer slots.
@@ -229,8 +246,13 @@ def parse_workbook(filepath: Path, debug: bool = False):
                             if italic:
                                 current_sq.hint = append_line(current_sq.hint, t)
                             current_sq.blocks.append(block)
+                        # Side-answer on the Q-number row attaches to the first sub-question.
+                        attach_side_answer(row, current_sq)
                         row_kind = (f"QUESTION {current_q.question_id}: "
                                     f"{current_sq.prompt[:70]!r}")
+                        if current_sq.side_answer:
+                            row_kind += (f"  ⊕ SIDE[{current_sq.side_answer_cell}="
+                                         f"{current_sq.side_answer!r}]")
 
                     elif current_q is not None:
                         # ── Content for current question ──────────────────
@@ -238,7 +260,18 @@ def parse_workbook(filepath: Path, debug: bool = False):
                         if current_sq is None:
                             current_sq = SubQuestion()
                         summaries = []
+                        # Side-answer (cols B–K) belongs to the *current* sub-question.
+                        # Attach it BEFORE the main-content loop so any grey/yellow
+                        # main-answer cell that triggers flush_subq() carries it along.
+                        side_cell = attach_side_answer(row, current_sq)
+                        if side_cell:
+                            summaries.append(f"SIDE[{side_cell}={current_sq.side_answer!r}]")
                         for c, t, cell, fill in row_cells:
+                            # Cells in the side-answer area (cols ≤ K) are handled by
+                            # attach_side_answer above; never treat them as main-answer
+                            # slots even when they have grey/yellow fill.
+                            if c <= SIDE_ANS_END_COL:
+                                continue
                             italic = bool(cell.font and cell.font.italic)
                             bold   = bool(cell.font and cell.font.bold)
                             block = ContentBlock(text=t, cell=cell.coordinate,
@@ -266,23 +299,6 @@ def parse_workbook(filepath: Path, debug: bool = False):
                                 )
                         if summaries:
                             row_kind = "CONTENT: " + " | ".join(summaries)
-
-                # ── Side-answer dropdown on this row ──────────────────────
-                if current_q is not None:
-                    for col in range(CONTENT_START_COL, SIDE_ANS_END_COL + 1):
-                        if (row, col) not in dropdowns:
-                            continue
-                        val = effective_value(ws, row, col, merged)
-                        if not val:
-                            continue
-                        if current_sq is None:
-                            current_sq = SubQuestion()
-                        current_sq.side_answer        = str(val).strip()
-                        current_sq.side_answer_options = dropdowns[(row, col)]
-                        current_sq.side_answer_cell   = f"{get_column_letter(col)}{row}"
-                        row_kind += (f"  ⊕ SIDE[{current_sq.side_answer_cell}="
-                                     f"{current_sq.side_answer!r}]")
-                        break
 
             # ── Remarks: anything OUTSIDE B:AO ────────────────────────────
             outside_cols = list(range(1, CONTENT_START_COL)) + \
