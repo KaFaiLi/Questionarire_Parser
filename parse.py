@@ -62,7 +62,8 @@ class ContentBlock:
 
 @dataclass
 class SubQuestion:
-    prompt: str = ""                     # all non-answer text leading up to the answer slot
+    option_label: str = ""               # branch label on a side-answer row (e.g. "Settling distributor")
+    prompt: str = ""                     # main non-answer text leading up to the answer slot
     hint: str = ""                       # convenience: italic text inside the prompt
     answer: str = ""                     # text in the grey/yellow answer slot (may be empty)
     answer_cell: str = ""
@@ -155,7 +156,7 @@ def parse_workbook(filepath: Path, debug: bool = False):
         seen_anchors: set = set()
 
         def is_meaningful(sq: SubQuestion) -> bool:
-            return bool(sq.prompt or sq.answer or sq.side_answer or sq.answer_cell)
+            return bool(sq.prompt or sq.option_label or sq.answer or sq.side_answer or sq.answer_cell)
 
         def flush_subq():
             nonlocal current_sq
@@ -260,6 +261,31 @@ def parse_workbook(filepath: Path, debug: bool = False):
                         if current_sq is None:
                             current_sq = SubQuestion()
                         summaries = []
+
+                        # Decide whether this row starts a NEW branch.
+                        # A side-answer dropdown WITHOUT a same-row main-answer cell,
+                        # but WITH other text on the row (e.g. a branch label), means
+                        # the previous sub-question is done and a new branch begins.
+                        # (Q5 pattern: side + answer on same row — stays in same SQ.
+                        #  Q7 pattern: side + label on a row, answer two rows below —
+                        #  new branch.)
+                        has_side_dropdown = any(
+                            (row, col) in dropdowns
+                            and effective_value(ws, row, col, merged)
+                            for col in range(CONTENT_START_COL, SIDE_ANS_END_COL + 1)
+                        )
+                        has_main_answer = any(
+                            c > SIDE_ANS_END_COL and fill in ANSWER_FILLS
+                            for c, _, _, fill in row_cells
+                        )
+                        has_main_text = any(
+                            c > SIDE_ANS_END_COL and t
+                            for c, t, _, _ in row_cells
+                        )
+                        new_branch = has_side_dropdown and not has_main_answer and has_main_text
+                        if new_branch:
+                            flush_subq()
+
                         # Side-answer (cols B–K) belongs to the *current* sub-question.
                         # Attach it BEFORE the main-content loop so any grey/yellow
                         # main-answer cell that triggers flush_subq() carries it along.
@@ -287,16 +313,25 @@ def parse_workbook(filepath: Path, debug: bool = False):
                                 # Close this sub-question; start a fresh one
                                 flush_subq()
                             elif t:
-                                # Plain text or green emphasis — part of the prompt
-                                block.role = "hint" if italic else "prompt"
-                                current_sq.prompt = append_line(current_sq.prompt, t)
-                                if italic:
-                                    current_sq.hint = append_line(current_sq.hint, t)
+                                # On a branch-starting row, non-italic text is the
+                                # option/branch label (distinct from the follow-up
+                                # sub-prompt). Everywhere else it's prompt text.
+                                if new_branch and not italic:
+                                    block.role = "option_label"
+                                    current_sq.option_label = append_line(current_sq.option_label, t)
+                                    summaries.append(
+                                        f"{cell.coordinate}[option_label,{fill}]"
+                                    )
+                                else:
+                                    block.role = "hint" if italic else "prompt"
+                                    current_sq.prompt = append_line(current_sq.prompt, t)
+                                    if italic:
+                                        current_sq.hint = append_line(current_sq.hint, t)
+                                    summaries.append(
+                                        f"{cell.coordinate}[{block.role},{fill}"
+                                        f"{',it' if italic else ''}]"
+                                    )
                                 current_sq.blocks.append(block)
-                                summaries.append(
-                                    f"{cell.coordinate}[{block.role},{fill}"
-                                    f"{',it' if italic else ''}]"
-                                )
                         if summaries:
                             row_kind = "CONTENT: " + " | ".join(summaries)
 
@@ -338,7 +373,7 @@ def write_json(sheets_out, path: Path):
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 XLSX_FIELDS = ["file_name", "sheet", "section", "question_id", "sub_idx",
-               "prompt", "hint", "answer", "answer_cell",
+               "option_label", "prompt", "hint", "answer", "answer_cell",
                "side_answer", "side_answer_options", "side_answer_cell"]
 
 def _iter_rows(file_name: str, sheets_out):
@@ -351,6 +386,7 @@ def _iter_rows(file_name: str, sheets_out):
                     it.section,
                     it.question_id,
                     idx,
+                    sq.option_label,
                     sq.prompt,
                     sq.hint,
                     sq.answer,
