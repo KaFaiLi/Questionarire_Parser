@@ -137,6 +137,39 @@ def is_section_header(cell, value: str) -> bool:
 def append_line(existing: str, new: str) -> str:
     return (existing + "\n" + new).strip() if existing else new
 
+def consolidate_multi_select(qa: "QAItem") -> None:
+    """Collapse Q8-style multi-select questions to a single sub-question.
+
+    Shape: a stem sub (prompt only) followed by 2+ option subs where each
+    option has option_label + side_answer (YES/NO) and no follow-up prompt
+    or main answer cell. Output sub keeps the stem prompt; `answer` becomes
+    the pipe-joined option_labels whose side_answer is YES.
+    """
+    subs = qa.sub_questions
+    if len(subs) < 2:
+        return
+    stem, options = subs[0], subs[1:]
+    if not stem.prompt:
+        return
+    if stem.option_label or stem.side_answer or stem.answer or stem.answer_cell:
+        return
+    if not all(
+        s.option_label and not s.prompt and not s.answer and not s.answer_cell
+        for s in options
+    ):
+        return
+    if not any(s.side_answer for s in options):
+        return
+    picks = [s.option_label for s in options
+             if s.side_answer.strip().upper() == "YES"]
+    consolidated = SubQuestion(
+        prompt=stem.prompt,
+        hint=stem.hint,
+        answer=" | ".join(picks),
+        blocks=[b for s in subs for b in s.blocks],
+    )
+    qa.sub_questions = [consolidated]
+
 # ───── Core parser ──────────────────────────────────────────────────────────
 def parse_workbook(filepath: Path, debug: bool = False):
     wb = openpyxl.load_workbook(filepath, data_only=True)
@@ -173,19 +206,31 @@ def parse_workbook(filepath: Path, debug: bool = False):
             current_q = None
             current_sq = None
 
+        def is_side_answer_cell(r, col) -> bool:
+            """A cell in the side-answer column band (B–K) counts as a side
+            answer when it has a value AND is either backed by a data-validation
+            dropdown OR visually marked (grey fill). Some questionnaires omit
+            the dropdown but still grey-fill the side cell."""
+            val = effective_value(ws, r, col, merged)
+            if not val:
+                return False
+            anchor = merged.get((r, col), (r, col))
+            has_dropdown = (r, col) in dropdowns or anchor in dropdowns
+            is_grey = classify_fill(ws.cell(anchor[0], anchor[1])) == "grey"
+            return has_dropdown or is_grey
+
         def attach_side_answer(r, sq) -> str | None:
-            """Find a side-answer dropdown on row `r` (cols B–K) and attach to
-            `sq`. Returns the cell ref if attached, else None."""
+            """Find a side-answer on row `r` (cols B–K) and attach to `sq`.
+            Returns the cell ref if attached, else None."""
             if sq is None:
                 return None
             for col in range(CONTENT_START_COL, SIDE_ANS_END_COL + 1):
-                if (r, col) not in dropdowns:
+                if not is_side_answer_cell(r, col):
                     continue
                 val = effective_value(ws, r, col, merged)
-                if not val:
-                    continue
+                anchor = merged.get((r, col), (r, col))
                 sq.side_answer         = str(val).strip()
-                sq.side_answer_options = dropdowns[(r, col)]
+                sq.side_answer_options = dropdowns.get((r, col)) or dropdowns.get(anchor, "")
                 sq.side_answer_cell    = f"{get_column_letter(col)}{r}"
                 return sq.side_answer_cell
             return None
@@ -263,15 +308,17 @@ def parse_workbook(filepath: Path, debug: bool = False):
                         summaries = []
 
                         # Decide whether this row starts a NEW branch.
-                        # A side-answer dropdown WITHOUT a same-row main-answer cell,
-                        # but WITH other text on the row (e.g. a branch label), means
-                        # the previous sub-question is done and a new branch begins.
+                        # A side-answer (dropdown OR grey-only) WITHOUT a same-row
+                        # main-answer cell, but WITH other text on the row (e.g. a
+                        # branch label), means the previous sub-question is done
+                        # and a new branch begins.
                         # (Q5 pattern: side + answer on same row — stays in same SQ.
                         #  Q7 pattern: side + label on a row, answer two rows below —
-                        #  new branch.)
-                        has_side_dropdown = any(
-                            (row, col) in dropdowns
-                            and effective_value(ws, row, col, merged)
+                        #  new branch.
+                        #  Q8 pattern: side + option_label on every row — each row
+                        #  is a new branch; consolidation happens post-parse.)
+                        has_side_answer = any(
+                            is_side_answer_cell(row, col)
                             for col in range(CONTENT_START_COL, SIDE_ANS_END_COL + 1)
                         )
                         has_main_answer = any(
@@ -282,7 +329,7 @@ def parse_workbook(filepath: Path, debug: bool = False):
                             c > SIDE_ANS_END_COL and t
                             for c, t, _, _ in row_cells
                         )
-                        new_branch = has_side_dropdown and not has_main_answer and has_main_text
+                        new_branch = has_side_answer and not has_main_answer and has_main_text
                         if new_branch:
                             flush_subq()
 
@@ -357,6 +404,8 @@ def parse_workbook(filepath: Path, debug: bool = False):
                 print(f"  row {row:>4}  {row_kind}")
 
         flush_question()
+        for it in items:
+            consolidate_multi_select(it)
         sheets_out[ws.title] = {"items": items, "remarks": remarks}
 
     return sheets_out
