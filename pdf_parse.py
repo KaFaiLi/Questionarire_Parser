@@ -1,10 +1,14 @@
 """
 PDF (vision-based) Questionnaire Parser
 =======================================
-Parses questionnaires by converting the xlsx to PDF, rendering each page to a
-PNG, and asking an Azure OpenAI vision model (via langchain) to extract the
-question_id / question / answer triples. Read-only / locked PDFs are fine —
-pypdfium2 renders them without modification.
+Parses questionnaires by converting the xlsx to PDF (via Excel + pywin32),
+rendering each page to a PNG, and asking an Azure OpenAI vision model (via
+langchain) to extract the question_id / question / answer triples. Read-only /
+locked PDFs are fine — pypdfium2 renders them without modification.
+
+The xlsx→pdf step only keeps columns **B:AN** on every sheet (the print area is
+restricted before export) so the irrelevant left margin (col A) and any noise
+to the right of AN never reach the LLM.
 
 Why a sliding window?
 ---------------------
@@ -38,8 +42,10 @@ AZURE_OPENAI_DEPLOYMENT     – chat deployment name (must be a vision model,
 AZURE_OPENAI_API_VERSION    – e.g. 2024-10-21 (default if unset)
 
 Dependencies (add to pyproject.toml or install separately):
-    pip install pypdfium2 langchain langchain-openai openpyxl pillow
-And the system needs LibreOffice ("soffice") on PATH for the xlsx→pdf step.
+    pip install pypdfium2 langchain langchain-openai openpyxl pillow pywin32
+The xlsx→pdf step uses Excel COM automation via pywin32, so it requires
+**Windows with Microsoft Excel installed**. PDF rendering and the LLM call
+both work cross-platform.
 
 Usage:
     python pdf_parse.py <file_or_dir> [--output-dir ./output] \
@@ -53,9 +59,7 @@ import base64
 import io
 import json
 import os
-import subprocess
 import sys
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -68,6 +72,14 @@ from langchain_openai import AzureChatOpenAI
 from pydantic import BaseModel, Field
 
 DEFAULT_API_VERSION = "2024-10-21"
+
+# xlsx→pdf print-area limits (inclusive). Columns outside this range are
+# excluded from every sheet before the PDF is exported.
+PRINT_COL_START = "B"
+PRINT_COL_END   = "AN"
+
+# Excel constant for ExportAsFixedFormat. (xlTypePDF = 0.)
+XL_TYPE_PDF = 0
 
 # ─── Data model the LLM must return ─────────────────────────────────────────
 class QA(BaseModel):
@@ -98,33 +110,74 @@ class QAList(BaseModel):
     questions: list[QA] = Field(default_factory=list)
 
 # ─── xlsx → pdf ─────────────────────────────────────────────────────────────
+def _sheet_last_row(ws) -> int:
+    """Last row that has any content anywhere on the sheet, via Excel's
+    UsedRange. Falls back to 1 if the sheet is empty."""
+    used = ws.UsedRange
+    if used is None:
+        return 1
+    return max(1, used.Row + used.Rows.Count - 1)
+
 def xlsx_to_pdf(xlsx_path: Path, out_dir: Path) -> Path:
-    """Convert an .xlsx to .pdf using headless LibreOffice. Returns the pdf path."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        "soffice", "--headless", "--norestore", "--nolockcheck",
-        "--convert-to", "pdf",
-        "--outdir", str(out_dir),
-        str(xlsx_path),
-    ]
-    # LibreOffice can deadlock if another instance shares the user profile; give
-    # each call its own throwaway profile directory.
-    with tempfile.TemporaryDirectory(prefix="lo-profile-") as profile:
-        env = os.environ.copy()
-        env["HOME"] = profile
-        result = subprocess.run(
-            cmd, env=env, capture_output=True, text=True, timeout=300,
-        )
-    if result.returncode != 0:
+    """Convert an .xlsx to .pdf using Excel COM automation (pywin32).
+
+    Every sheet's print area is restricted to ``{PRINT_COL_START}:{PRINT_COL_END}``
+    (default B:AN) before export, and each sheet is scaled to one page wide so
+    the kept columns don't overflow horizontally. Windows + Excel only.
+    """
+    try:
+        import pythoncom
+        import win32com.client
+    except ImportError as e:
         raise RuntimeError(
-            f"LibreOffice failed for {xlsx_path.name}:\n"
-            f"  stdout: {result.stdout.strip()}\n"
-            f"  stderr: {result.stderr.strip()}"
-        )
-    pdf = out_dir / f"{xlsx_path.stem}.pdf"
-    if not pdf.exists():
-        raise RuntimeError(f"Expected {pdf} after LibreOffice convert, not found.")
-    return pdf
+            "pywin32 (win32com) is required for the xlsx→pdf step. "
+            "Install with `pip install pywin32` on Windows with Excel."
+        ) from e
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = (out_dir / f"{xlsx_path.stem}.pdf").resolve()
+    src_path = xlsx_path.resolve()
+
+    pythoncom.CoInitialize()
+    excel = None
+    wb = None
+    try:
+        # DispatchEx → dedicated Excel instance, won't share state with a user
+        # session and is safe to Quit() unconditionally.
+        excel = win32com.client.DispatchEx("Excel.Application")
+        excel.Visible = False
+        excel.DisplayAlerts = False
+        excel.ScreenUpdating = False
+
+        wb = excel.Workbooks.Open(str(src_path), ReadOnly=True, UpdateLinks=0)
+
+        for ws in wb.Worksheets:
+            last_row = _sheet_last_row(ws)
+            ws.PageSetup.PrintArea = (
+                f"${PRINT_COL_START}$1:${PRINT_COL_END}${last_row}"
+            )
+            # Fit-to-width=1 so the B:AN band always lands on one page wide;
+            # height is left free so long sheets paginate naturally.
+            ws.PageSetup.Zoom = False
+            ws.PageSetup.FitToPagesWide = 1
+            ws.PageSetup.FitToPagesTall = False
+
+        wb.ExportAsFixedFormat(XL_TYPE_PDF, str(pdf_path))
+
+        if not pdf_path.exists():
+            raise RuntimeError(
+                f"Excel did not produce {pdf_path} (ExportAsFixedFormat succeeded "
+                f"but the file is missing)."
+            )
+        return pdf_path
+    finally:
+        try:
+            if wb is not None:
+                wb.Close(SaveChanges=False)
+        finally:
+            if excel is not None:
+                excel.Quit()
+            pythoncom.CoUninitialize()
 
 # ─── pdf → PNG pages ────────────────────────────────────────────────────────
 def render_pdf_pages(pdf_path: Path, dpi: int = 200) -> list[Image.Image]:
