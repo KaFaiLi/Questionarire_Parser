@@ -71,12 +71,28 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import AzureChatOpenAI
 from pydantic import BaseModel, Field
 
+# Helpers reused from the cell-based parser. The reconcile pass needs the same
+# notion of "answer cell" (grey/yellow fill) and question-id pattern.
+from parse import (
+    ANSWER_FILLS,
+    CONTENT_END_COL,
+    CONTENT_START_COL,
+    Q_PATTERN,
+    build_merged_lookup,
+    classify_fill,
+    effective_value,
+)
+
 DEFAULT_API_VERSION = "2024-10-21"
 
 # xlsx→pdf print-area limits (inclusive). Columns outside this range are
 # excluded from every sheet before the PDF is exported.
 PRINT_COL_START = "B"
 PRINT_COL_END   = "AN"
+
+# A column safely past PRINT_COL_END used as a measurement surface for the
+# merged-cell row-height AutoFit pass. Nothing written here can reach the PDF.
+SCRATCH_COL_LETTER = "AZ"
 
 # Excel constant for ExportAsFixedFormat. (xlTypePDF = 0.)
 XL_TYPE_PDF = 0
@@ -118,12 +134,79 @@ def _sheet_last_row(ws) -> int:
         return 1
     return max(1, used.Row + used.Rows.Count - 1)
 
+def _is_blank_value(v) -> bool:
+    return v is None or (isinstance(v, str) and not v.strip())
+
+def _autofit_merged_rows(ws, last_row: int) -> int:
+    """Grow row heights so each merged wrap-text cell fits its full text.
+
+    Excel does NOT auto-fit row height for merged cells (a well-known
+    limitation), so answer boxes with long wrapped text get visually clipped
+    in the exported PDF. We measure the required height for each merged
+    wrap-text cell using a scratch column past the export band, and grow
+    the anchor row accordingly. Returns the number of rows adjusted.
+    """
+    scratch_col = ws.Columns(SCRATCH_COL_LETTER)
+    scratch_col_index = scratch_col.Column
+    original_width = scratch_col.ColumnWidth
+    # Pick a measurement row far past any real content so the AutoFit on
+    # that row only sees our scratch cell, not real cells we'd grow by
+    # accident.
+    measurement_row = last_row + 10
+    seen: set[str] = set()
+    adjusted = 0
+
+    try:
+        for cell in ws.UsedRange:
+            area = cell.MergeArea
+            if area.Cells.Count == 1:
+                continue
+            addr = area.Address
+            if addr in seen:
+                continue
+            seen.add(addr)
+
+            anchor = area.Cells(1, 1)
+            if not anchor.WrapText:
+                continue
+            if _is_blank_value(anchor.Value):
+                continue
+
+            first_col = area.Column
+            n_cols = area.Columns.Count
+            total_width = sum(
+                ws.Columns(first_col + i).ColumnWidth for i in range(n_cols)
+            )
+
+            scratch_col.ColumnWidth = total_width
+            scratch_cell = ws.Cells(measurement_row, scratch_col_index)
+            scratch_cell.WrapText = True
+            scratch_cell.Value = anchor.Value
+            # Copy font properties so the measurement reflects the real cell.
+            scratch_cell.Font.Name   = anchor.Font.Name
+            scratch_cell.Font.Size   = anchor.Font.Size
+            scratch_cell.Font.Bold   = anchor.Font.Bold
+            scratch_cell.Font.Italic = anchor.Font.Italic
+            scratch_cell.EntireRow.AutoFit()
+            needed = scratch_cell.RowHeight
+
+            anchor_row = ws.Rows(area.Row)
+            if needed > anchor_row.RowHeight:
+                anchor_row.RowHeight = needed
+                adjusted += 1
+    finally:
+        scratch_col.Clear()
+        scratch_col.ColumnWidth = original_width
+
+    return adjusted
+
 def xlsx_to_pdf(xlsx_path: Path, out_dir: Path) -> Path:
     """Convert an .xlsx to .pdf using Excel COM automation (pywin32).
 
     Every sheet's print area is restricted to ``{PRINT_COL_START}:{PRINT_COL_END}``
-    (default B:AN) before export, and each sheet is scaled to one page wide so
-    the kept columns don't overflow horizontally. Windows + Excel only.
+    (default B:AN), each sheet is scaled to one page wide, and every merged
+    wrap-text cell has its row height grown so long answers don't get
+    visually clipped in the PDF. Windows + Excel only.
     """
     try:
         import pythoncom
@@ -151,8 +234,18 @@ def xlsx_to_pdf(xlsx_path: Path, out_dir: Path) -> Path:
 
         wb = excel.Workbooks.Open(str(src_path), ReadOnly=True, UpdateLinks=0)
 
+        # Snapshot last row per sheet BEFORE any mutation so the scratch-column
+        # writes inside _autofit_merged_rows can't inflate it.
+        sheet_last_rows: dict[str, int] = {
+            ws.Name: _sheet_last_row(ws) for ws in wb.Worksheets
+        }
+
         for ws in wb.Worksheets:
-            last_row = _sheet_last_row(ws)
+            last_row = sheet_last_rows[ws.Name]
+            n_adjusted = _autofit_merged_rows(ws, last_row=last_row)
+            if n_adjusted:
+                print(f"    auto-expanded {n_adjusted} merged row(s) on '{ws.Name}'")
+
             ws.PageSetup.PrintArea = (
                 f"${PRINT_COL_START}$1:${PRINT_COL_END}${last_row}"
             )
@@ -280,10 +373,11 @@ def extract_from_window(
     ])
     return [
         {
-            "question_id": q.question_id.strip(),
-            "question":    q.question.strip(),
-            "answer":      q.answer.strip(),
-            "source_pages": list(page_numbers),
+            "question_id":   q.question_id.strip(),
+            "question":      q.question.strip(),
+            "answer":        q.answer.strip(),
+            "source_pages":  list(page_numbers),
+            "answer_source": "llm",
         }
         for q in result.questions
         if q.question_id.strip()
@@ -332,6 +426,84 @@ def dedupe_by_id(items: list[dict]) -> list[dict]:
         return (nums or [10**9], qid)
     return [best[qid] for qid in sorted(best, key=sort_key)]
 
+# ─── xlsx reconcile (truncation safety net) ────────────────────────────────
+def _normalise(s: str) -> str:
+    return " ".join(s.split()).casefold()
+
+def _collect_xlsx_answers(xlsx_path: Path) -> dict[str, str]:
+    """qid → full answer text, by scanning the source xlsx with openpyxl.
+
+    Uses the same definition of "answer cell" as parse.py: a grey/yellow
+    fill in the B:AO content band, belonging to the most recent Q-id seen.
+    Multiple answer cells for the same Q-id are joined with newlines.
+    """
+    wb = openpyxl.load_workbook(xlsx_path, data_only=True)
+    answers: dict[str, str] = {}
+
+    for ws in wb.worksheets:
+        merged = build_merged_lookup(ws)
+        current_qid: str | None = None
+        seen_anchors: set = set()
+
+        for row in range(1, ws.max_row + 1):
+            for col in range(CONTENT_START_COL, CONTENT_END_COL + 1):
+                anchor = merged.get((row, col), (row, col))
+                if anchor in seen_anchors:
+                    continue
+                seen_anchors.add(anchor)
+
+                cell = ws.cell(anchor[0], anchor[1])
+                val = effective_value(ws, row, col, merged)
+                text = "" if val is None else str(val).strip()
+
+                m = Q_PATTERN.match(text) if text else None
+                if m:
+                    current_qid = m.group(0)
+                    continue
+                if current_qid is None:
+                    continue
+                if not text:
+                    continue
+                if classify_fill(cell) in ANSWER_FILLS:
+                    existing = answers.get(current_qid, "")
+                    answers[current_qid] = (
+                        existing + "\n" + text if existing else text
+                    )
+    return answers
+
+def reconcile_with_xlsx(
+    items: list[dict], xlsx_path: Path
+) -> tuple[list[dict], int]:
+    """Replace LLM answers that look truncated with the full text from the
+    source xlsx. Modifies items in place and also returns them. The second
+    return value is the number of answers reconciled."""
+    answers = _collect_xlsx_answers(xlsx_path)
+    n_reconciled = 0
+
+    for item in items:
+        item.setdefault("answer_source", "llm")
+        truth = answers.get(item["question_id"])
+        if not truth:
+            continue
+
+        llm_ans = item["answer"]
+        if not llm_ans:
+            item["answer"] = truth
+            item["answer_source"] = "xlsx_reconciled"
+            n_reconciled += 1
+            continue
+
+        truth_n = _normalise(truth)
+        llm_n   = _normalise(llm_ans)
+        # Truncation signature: the LLM's answer is a prefix of the xlsx
+        # cell's full text, and the xlsx has materially more content.
+        if truth_n.startswith(llm_n) and len(truth_n) > len(llm_n) + 5:
+            item["answer"] = truth
+            item["answer_source"] = "xlsx_reconciled"
+            n_reconciled += 1
+
+    return items, n_reconciled
+
 # ─── Orchestration ──────────────────────────────────────────────────────────
 @dataclass
 class ParseResult:
@@ -348,11 +520,13 @@ def parse_one(
     stride: int,
     keep_pngs: bool,
 ) -> ParseResult:
+    xlsx_source: Path | None = None
     if src.suffix.lower() == ".pdf":
         pdf_path = src
     elif src.suffix.lower() in {".xlsx", ".xlsm"}:
-        print(f"  → converting {src.name} to PDF via LibreOffice")
+        print(f"  → converting {src.name} to PDF via Excel COM")
         pdf_path = xlsx_to_pdf(src, out_dir)
+        xlsx_source = src
     else:
         raise ValueError(f"Unsupported input type: {src.suffix}")
 
@@ -380,10 +554,22 @@ def parse_one(
 
     merged = dedupe_by_id(all_items)
     print(f"    extracted {len(merged)} unique question(s)")
+
+    if xlsx_source is not None:
+        try:
+            merged, n_rec = reconcile_with_xlsx(merged, xlsx_source)
+            if n_rec:
+                print(f"    reconciled {n_rec} answer(s) from xlsx source text")
+        except Exception as e:
+            print(f"    ! xlsx reconcile failed: {e}", file=sys.stderr)
+
     return ParseResult(file_name=src.stem, pdf_path=pdf_path, items=merged)
 
 # ─── Writers ────────────────────────────────────────────────────────────────
-XLSX_FIELDS = ["file_name", "question_id", "question", "answer", "source_pages"]
+XLSX_FIELDS = [
+    "file_name", "question_id", "question", "answer",
+    "answer_source", "source_pages",
+]
 
 def write_json(result: ParseResult, path: Path) -> None:
     path.write_text(
@@ -406,6 +592,7 @@ def write_xlsx(results: list[ParseResult], path: Path) -> None:
                 it["question_id"],
                 it["question"],
                 it["answer"],
+                it.get("answer_source", "llm"),
                 ", ".join(map(str, it["source_pages"])),
             ])
     wb.save(path)
