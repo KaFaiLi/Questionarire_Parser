@@ -70,6 +70,7 @@ import openpyxl
 import pypdfium2 as pdfium
 from PIL import Image
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.runnables import Runnable
 from langchain_openai import AzureChatOpenAI
 from pydantic import BaseModel, Field
 
@@ -345,6 +346,8 @@ SYSTEM_PROMPT = (
 )
 
 def build_llm(model_kwargs: dict | None = None) -> AzureChatOpenAI:
+    """Construct the underlying Azure ChatOpenAI client. Call this **once**
+    per process — it opens an HTTP client and configures the deployment."""
     endpoint   = os.environ.get("AZURE_OPENAI_ENDPOINT")
     api_key    = os.environ.get("AZURE_OPENAI_API_KEY")
     deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT")
@@ -369,6 +372,17 @@ def build_llm(model_kwargs: dict | None = None) -> AzureChatOpenAI:
         max_retries=0,
         **(model_kwargs or {}),
     )
+
+def build_structured_llm(
+    model_kwargs: dict | None = None,
+) -> Runnable:
+    """Construct the structured-output runnable used by every window.
+
+    Wraps ``build_llm()`` with ``with_structured_output(QAList)`` exactly
+    once so neither the underlying HTTP client nor the structured-output
+    binding gets re-created per LLM call.
+    """
+    return build_llm(model_kwargs).with_structured_output(QAList)
 
 T = TypeVar("T")
 
@@ -403,13 +417,15 @@ def call_with_retry(
     raise RuntimeError("call_with_retry exhausted attempts without raising")
 
 def extract_from_window(
-    llm: AzureChatOpenAI,
+    structured_llm: Runnable,
     page_images: list[Image.Image],
     page_numbers: list[int],
 ) -> list[dict]:
     """Run the vision model on a window of consecutive pages and return parsed
-    items. Each returned dict carries `source_pages` so we know which window
-    produced it."""
+    items. ``structured_llm`` is the pre-built ``with_structured_output``
+    runnable from ``build_structured_llm()`` — it is reused across every
+    window so we don't re-initialise the client. Each returned dict carries
+    ``source_pages`` so we know which window produced it."""
     user_content: list[dict] = [{
         "type": "text",
         "text": (
@@ -424,8 +440,7 @@ def extract_from_window(
             "image_url": {"url": image_to_data_url(img), "detail": "high"},
         })
 
-    structured = llm.with_structured_output(QAList)
-    result: QAList = structured.invoke([
+    result: QAList = structured_llm.invoke([
         SystemMessage(content=SYSTEM_PROMPT),
         HumanMessage(content=user_content),
     ])
@@ -577,7 +592,7 @@ class ParseResult:
 def parse_one(
     src: Path,
     out_dir: Path,
-    llm: AzureChatOpenAI,
+    structured_llm: Runnable,
     dpi: int,
     window: int,
     stride: int,
@@ -621,7 +636,7 @@ def parse_one(
             win_imgs = [pages[p - 1] for p in win]
             try:
                 items = call_with_retry(
-                    lambda: extract_from_window(llm, win_imgs, win),
+                    lambda: extract_from_window(structured_llm, win_imgs, win),
                     max_attempts=max_attempts,
                     label=f"sheet '{sheet_name}' pages {win}",
                 )
@@ -720,14 +735,16 @@ def main() -> None:
         print(f"No xlsx/pdf inputs found in {target}", file=sys.stderr)
         sys.exit(1)
 
-    llm = build_llm()
+    # Build the model and the structured-output wrapper exactly once for the
+    # whole run; reuse across every file, sheet, and window.
+    structured_llm = build_structured_llm()
 
     results: list[ParseResult] = []
     for fp in files:
         print(f"→ {fp.name}")
         try:
             res = parse_one(
-                fp, out_dir, llm,
+                fp, out_dir, structured_llm,
                 dpi=args.dpi, window=args.window, stride=args.stride,
                 keep_pngs=args.keep_pngs, max_attempts=args.max_attempts,
             )
