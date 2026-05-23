@@ -59,10 +59,12 @@ import base64
 import io
 import json
 import os
+import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable, TypeVar
 
 import openpyxl
 import pypdfium2 as pdfium
@@ -96,6 +98,13 @@ SCRATCH_COL_LETTER = "AZ"
 
 # Excel constant for ExportAsFixedFormat. (xlTypePDF = 0.)
 XL_TYPE_PDF = 0
+
+# LLM retry policy. We don't use langchain's built-in retry (`max_retries`)
+# because it only retries certain transport errors — we want to retry on
+# anything (404s, parsing/validation errors, rate limits, transient network
+# failures) with explicit visibility in logs.
+DEFAULT_MAX_ATTEMPTS = 4
+DEFAULT_RETRY_BASE_DELAY = 2.0  # seconds; doubles each attempt
 
 # ─── Data model the LLM must return ─────────────────────────────────────────
 class QA(BaseModel):
@@ -200,13 +209,21 @@ def _autofit_merged_rows(ws, last_row: int) -> int:
 
     return adjusted
 
-def xlsx_to_pdf(xlsx_path: Path, out_dir: Path) -> Path:
-    """Convert an .xlsx to .pdf using Excel COM automation (pywin32).
+_FILENAME_BAD = re.compile(r'[/\\:*?"<>|]+')
 
-    Every sheet's print area is restricted to ``{PRINT_COL_START}:{PRINT_COL_END}``
-    (default B:AN), each sheet is scaled to one page wide, and every merged
-    wrap-text cell has its row height grown so long answers don't get
-    visually clipped in the PDF. Windows + Excel only.
+def _safe_filename(s: str) -> str:
+    cleaned = _FILENAME_BAD.sub("_", s).strip()
+    return cleaned or "sheet"
+
+def xlsx_to_pdf(xlsx_path: Path, out_dir: Path) -> dict[str, Path]:
+    """Convert an .xlsx to one .pdf **per worksheet** using Excel COM.
+
+    Returns ``{sheet_name: pdf_path}`` so downstream stages can attribute
+    extracted questions to the right sheet (workbooks routinely contain
+    several questionnaires on separate sheets). Each sheet's print area is
+    restricted to ``{PRINT_COL_START}:{PRINT_COL_END}`` (default B:AN),
+    scaled to one page wide, and has merged-wrap-text row heights expanded.
+    Windows + Excel only.
     """
     try:
         import pythoncom
@@ -218,15 +235,12 @@ def xlsx_to_pdf(xlsx_path: Path, out_dir: Path) -> Path:
         ) from e
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    pdf_path = (out_dir / f"{xlsx_path.stem}.pdf").resolve()
     src_path = xlsx_path.resolve()
 
     pythoncom.CoInitialize()
     excel = None
     wb = None
     try:
-        # DispatchEx → dedicated Excel instance, won't share state with a user
-        # session and is safe to Quit() unconditionally.
         excel = win32com.client.DispatchEx("Excel.Application")
         excel.Visible = False
         excel.DisplayAlerts = False
@@ -240,29 +254,39 @@ def xlsx_to_pdf(xlsx_path: Path, out_dir: Path) -> Path:
             ws.Name: _sheet_last_row(ws) for ws in wb.Worksheets
         }
 
+        out: dict[str, Path] = {}
+        used_stems: set[str] = set()
         for ws in wb.Worksheets:
-            last_row = sheet_last_rows[ws.Name]
+            sheet_name = ws.Name
+            last_row = sheet_last_rows[sheet_name]
             n_adjusted = _autofit_merged_rows(ws, last_row=last_row)
             if n_adjusted:
-                print(f"    auto-expanded {n_adjusted} merged row(s) on '{ws.Name}'")
+                print(f"    auto-expanded {n_adjusted} merged row(s) on '{sheet_name}'")
 
             ws.PageSetup.PrintArea = (
                 f"${PRINT_COL_START}$1:${PRINT_COL_END}${last_row}"
             )
-            # Fit-to-width=1 so the B:AN band always lands on one page wide;
-            # height is left free so long sheets paginate naturally.
             ws.PageSetup.Zoom = False
             ws.PageSetup.FitToPagesWide = 1
             ws.PageSetup.FitToPagesTall = False
 
-        wb.ExportAsFixedFormat(XL_TYPE_PDF, str(pdf_path))
+            base = f"{xlsx_path.stem}__{_safe_filename(sheet_name)}"
+            stem = base
+            i = 2
+            while stem.lower() in used_stems:
+                stem = f"{base}_{i}"
+                i += 1
+            used_stems.add(stem.lower())
 
-        if not pdf_path.exists():
-            raise RuntimeError(
-                f"Excel did not produce {pdf_path} (ExportAsFixedFormat succeeded "
-                f"but the file is missing)."
-            )
-        return pdf_path
+            sheet_pdf = (out_dir / f"{stem}.pdf").resolve()
+            ws.ExportAsFixedFormat(XL_TYPE_PDF, str(sheet_pdf))
+            if not sheet_pdf.exists():
+                raise RuntimeError(
+                    f"Excel did not produce {sheet_pdf} for sheet '{sheet_name}'."
+                )
+            out[sheet_name] = sheet_pdf
+
+        return out
     finally:
         try:
             if wb is not None:
@@ -340,9 +364,43 @@ def build_llm(model_kwargs: dict | None = None) -> AzureChatOpenAI:
         azure_deployment=deployment,
         api_version=api_ver,
         temperature=0,
-        max_retries=3,
+        # We do our own retry (call_with_retry) so the langchain layer
+        # shouldn't add hidden retries on top.
+        max_retries=0,
         **(model_kwargs or {}),
     )
+
+T = TypeVar("T")
+
+def call_with_retry(
+    fn: Callable[[], T],
+    *,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    base_delay: float = DEFAULT_RETRY_BASE_DELAY,
+    label: str = "call",
+) -> T:
+    """Run ``fn()`` with exponential-backoff retry on **any** exception.
+
+    Retries on Pydantic ValidationError (LLM returned malformed structured
+    output), 404 / 429 / 5xx HTTP errors from the API, transient network
+    failures, and anything else. The final attempt's exception propagates.
+    Delays follow 2s, 4s, 8s, ... by default.
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn()
+        except Exception as e:
+            if attempt >= max_attempts:
+                raise
+            delay = base_delay * (2 ** (attempt - 1))
+            print(
+                f"      {label} attempt {attempt}/{max_attempts} failed "
+                f"({type(e).__name__}: {e}); retrying in {delay:.1f}s",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+    # Unreachable: the loop either returns or raises.
+    raise RuntimeError("call_with_retry exhausted attempts without raising")
 
 def extract_from_window(
     llm: AzureChatOpenAI,
@@ -405,42 +463,47 @@ def _completeness(item: dict) -> tuple[int, int]:
     return (has_answer, len(item["question"]) + len(item["answer"]))
 
 def dedupe_by_id(items: list[dict]) -> list[dict]:
-    best: dict[str, dict] = {}
+    """Dedup keyed by (sheet, question_id): the same Q-id can appear on two
+    different sheets of the same workbook and must stay separate."""
+    best: dict[tuple[str, str], dict] = {}
     for it in items:
-        qid = it["question_id"]
-        if qid not in best:
-            best[qid] = it
+        key = (it.get("sheet", ""), it["question_id"])
+        if key not in best:
+            best[key] = it
             continue
-        if _completeness(it) > _completeness(best[qid]):
-            merged_pages = sorted(set(best[qid]["source_pages"]) | set(it["source_pages"]))
-            it = {**it, "source_pages": merged_pages}
-            best[qid] = it
-        else:
-            best[qid]["source_pages"] = sorted(
-                set(best[qid]["source_pages"]) | set(it["source_pages"])
+        if _completeness(it) > _completeness(best[key]):
+            merged_pages = sorted(
+                set(best[key]["source_pages"]) | set(it["source_pages"])
             )
-    # Natural sort by the numeric part of the id when possible, otherwise lexical.
-    def sort_key(qid: str):
-        import re
+            it = {**it, "source_pages": merged_pages}
+            best[key] = it
+        else:
+            best[key]["source_pages"] = sorted(
+                set(best[key]["source_pages"]) | set(it["source_pages"])
+            )
+
+    def sort_key(k: tuple[str, str]):
+        sheet, qid = k
         nums = [int(n) for n in re.findall(r"\d+", qid)]
-        return (nums or [10**9], qid)
-    return [best[qid] for qid in sorted(best, key=sort_key)]
+        return (sheet, nums or [10**9], qid)
+
+    return [best[k] for k in sorted(best, key=sort_key)]
 
 # ─── xlsx reconcile (truncation safety net) ────────────────────────────────
 def _normalise(s: str) -> str:
     return " ".join(s.split()).casefold()
 
-def _collect_xlsx_answers(xlsx_path: Path) -> dict[str, str]:
-    """qid → full answer text, by scanning the source xlsx with openpyxl.
-
-    Uses the same definition of "answer cell" as parse.py: a grey/yellow
-    fill in the B:AO content band, belonging to the most recent Q-id seen.
-    Multiple answer cells for the same Q-id are joined with newlines.
-    """
+def _collect_xlsx_answers(xlsx_path: Path) -> dict[tuple[str, str], str]:
+    """(sheet_name, qid) → full answer text, by scanning the source xlsx
+    with openpyxl. Same notion of "answer cell" as parse.py: grey/yellow
+    fill in the B:AO content band, attributed to the most recent Q-id on
+    that sheet. Multiple answer cells for the same Q-id are joined with
+    newlines."""
     wb = openpyxl.load_workbook(xlsx_path, data_only=True)
-    answers: dict[str, str] = {}
+    answers: dict[tuple[str, str], str] = {}
 
     for ws in wb.worksheets:
+        sheet_name = ws.title
         merged = build_merged_lookup(ws)
         current_qid: str | None = None
         seen_anchors: set = set()
@@ -465,8 +528,9 @@ def _collect_xlsx_answers(xlsx_path: Path) -> dict[str, str]:
                 if not text:
                     continue
                 if classify_fill(cell) in ANSWER_FILLS:
-                    existing = answers.get(current_qid, "")
-                    answers[current_qid] = (
+                    key = (sheet_name, current_qid)
+                    existing = answers.get(key, "")
+                    answers[key] = (
                         existing + "\n" + text if existing else text
                     )
     return answers
@@ -475,14 +539,14 @@ def reconcile_with_xlsx(
     items: list[dict], xlsx_path: Path
 ) -> tuple[list[dict], int]:
     """Replace LLM answers that look truncated with the full text from the
-    source xlsx. Modifies items in place and also returns them. The second
-    return value is the number of answers reconciled."""
+    source xlsx. Matches by (sheet, question_id). Modifies items in place
+    and returns them, plus the count of substitutions made."""
     answers = _collect_xlsx_answers(xlsx_path)
     n_reconciled = 0
 
     for item in items:
         item.setdefault("answer_source", "llm")
-        truth = answers.get(item["question_id"])
+        truth = answers.get((item.get("sheet", ""), item["question_id"]))
         if not truth:
             continue
 
@@ -508,7 +572,6 @@ def reconcile_with_xlsx(
 @dataclass
 class ParseResult:
     file_name: str
-    pdf_path: Path
     items: list[dict]
 
 def parse_one(
@@ -519,55 +582,76 @@ def parse_one(
     window: int,
     stride: int,
     keep_pngs: bool,
+    max_attempts: int,
 ) -> ParseResult:
+    """Process a single xlsx (or pdf) end-to-end.
+
+    For xlsx: every worksheet is exported to its own PDF, processed
+    separately, and items carry the originating sheet name. For pdf: the
+    file is processed as a single 'sheet' named after the file stem.
+    """
+    # sheet_name → pdf_path
+    sheet_pdfs: dict[str, Path]
     xlsx_source: Path | None = None
     if src.suffix.lower() == ".pdf":
-        pdf_path = src
+        sheet_pdfs = {src.stem: src}
     elif src.suffix.lower() in {".xlsx", ".xlsm"}:
-        print(f"  → converting {src.name} to PDF via Excel COM")
-        pdf_path = xlsx_to_pdf(src, out_dir)
+        print(f"  → converting {src.name} to PDF via Excel COM (per sheet)")
+        sheet_pdfs = xlsx_to_pdf(src, out_dir)
         xlsx_source = src
+        print(f"    {len(sheet_pdfs)} sheet(s): {', '.join(sheet_pdfs)}")
     else:
         raise ValueError(f"Unsupported input type: {src.suffix}")
 
-    print(f"  → rendering {pdf_path.name} at {dpi} dpi")
-    pages = render_pdf_pages(pdf_path, dpi=dpi)
-    n = len(pages)
-    print(f"    {n} page(s)")
-
-    if keep_pngs:
-        png_dir = out_dir / f"{src.stem}_pages"
-        png_dir.mkdir(parents=True, exist_ok=True)
-        for i, img in enumerate(pages, 1):
-            img.save(png_dir / f"page_{i:03d}.png")
-
     all_items: list[dict] = []
-    for win in iter_windows(n, window=window, stride=stride):
-        print(f"    LLM call on pages {win}")
-        win_imgs = [pages[p - 1] for p in win]
-        try:
-            items = extract_from_window(llm, win_imgs, win)
-        except Exception as e:
-            print(f"      ! failed on window {win}: {e}", file=sys.stderr)
-            continue
-        all_items.extend(items)
+    for sheet_name, pdf_path in sheet_pdfs.items():
+        print(f"  → sheet '{sheet_name}': rendering {pdf_path.name} at {dpi} dpi")
+        pages = render_pdf_pages(pdf_path, dpi=dpi)
+        n = len(pages)
+        print(f"    {n} page(s)")
+
+        if keep_pngs:
+            png_dir = out_dir / f"{pdf_path.stem}_pages"
+            png_dir.mkdir(parents=True, exist_ok=True)
+            for i, img in enumerate(pages, 1):
+                img.save(png_dir / f"page_{i:03d}.png")
+
+        for win in iter_windows(n, window=window, stride=stride):
+            print(f"    LLM call on pages {win}")
+            win_imgs = [pages[p - 1] for p in win]
+            try:
+                items = call_with_retry(
+                    lambda: extract_from_window(llm, win_imgs, win),
+                    max_attempts=max_attempts,
+                    label=f"sheet '{sheet_name}' pages {win}",
+                )
+            except Exception as e:
+                print(
+                    f"      ! gave up on sheet '{sheet_name}' window {win} "
+                    f"after {max_attempts} attempts: {e}",
+                    file=sys.stderr,
+                )
+                continue
+            for it in items:
+                it["sheet"] = sheet_name
+            all_items.extend(items)
 
     merged = dedupe_by_id(all_items)
-    print(f"    extracted {len(merged)} unique question(s)")
+    print(f"  extracted {len(merged)} unique question(s) across all sheets")
 
     if xlsx_source is not None:
         try:
             merged, n_rec = reconcile_with_xlsx(merged, xlsx_source)
             if n_rec:
-                print(f"    reconciled {n_rec} answer(s) from xlsx source text")
+                print(f"  reconciled {n_rec} answer(s) from xlsx source text")
         except Exception as e:
-            print(f"    ! xlsx reconcile failed: {e}", file=sys.stderr)
+            print(f"  ! xlsx reconcile failed: {e}", file=sys.stderr)
 
-    return ParseResult(file_name=src.stem, pdf_path=pdf_path, items=merged)
+    return ParseResult(file_name=src.stem, items=merged)
 
 # ─── Writers ────────────────────────────────────────────────────────────────
 XLSX_FIELDS = [
-    "file_name", "question_id", "question", "answer",
+    "file_name", "sheet", "question_id", "question", "answer",
     "answer_source", "source_pages",
 ]
 
@@ -589,6 +673,7 @@ def write_xlsx(results: list[ParseResult], path: Path) -> None:
         for it in r.items:
             ws.append([
                 r.file_name,
+                it.get("sheet", ""),
                 it["question_id"],
                 it["question"],
                 it["answer"],
@@ -613,6 +698,10 @@ def main() -> None:
                     help="Step between window starts (default 1 = overlap)")
     ap.add_argument("--keep-pngs", action="store_true",
                     help="Also save the rendered page PNGs alongside the PDF")
+    ap.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS,
+                    help=f"Max LLM attempts per window before giving up "
+                         f"(default {DEFAULT_MAX_ATTEMPTS}). Custom retry — "
+                         f"langchain's own retry is disabled.")
     args = ap.parse_args()
 
     target  = Path(args.target)
@@ -640,7 +729,7 @@ def main() -> None:
             res = parse_one(
                 fp, out_dir, llm,
                 dpi=args.dpi, window=args.window, stride=args.stride,
-                keep_pngs=args.keep_pngs,
+                keep_pngs=args.keep_pngs, max_attempts=args.max_attempts,
             )
         except Exception as e:
             print(f"  ✗ failed: {e}", file=sys.stderr)
