@@ -366,6 +366,7 @@ def question_changes(long: pd.DataFrame, labels: dict[int, str]) -> pd.DataFrame
             rows.append(
                 {
                     "canonical_id": f"CQ{cid + 1}",
+                    "Question": labels[cid],          # most repeated actual question
                     "drift_type": drift,
                     "n_variants": len(variants),
                     "variant_text": variant,
@@ -375,8 +376,8 @@ def question_changes(long: pd.DataFrame, labels: dict[int, str]) -> pd.DataFrame
             )
     return pd.DataFrame(
         rows,
-        columns=["canonical_id", "drift_type", "n_variants", "variant_text",
-                 "used_by_count", "used_by"],
+        columns=["canonical_id", "Question", "drift_type", "n_variants",
+                 "variant_text", "used_by_count", "used_by"],
     )
 
 
@@ -499,7 +500,7 @@ def write_report(path: Path, sheets: dict[str, pd.DataFrame]) -> None:
             df.to_excel(writer, sheet_name=safe, index=False)
             _autosize(writer.sheets[safe], df,
                       wide_cols={"canonical_text", "question_text", "variant_text",
-                                 "used_by", "present_in", "missing_from",
+                                 "Question", "used_by", "present_in", "missing_from",
                                  "source_question_ids", "answer"})
             writer.sheets[safe].freeze_panes = "A2"
 
