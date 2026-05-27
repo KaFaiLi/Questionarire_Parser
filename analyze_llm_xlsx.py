@@ -106,12 +106,22 @@ _PUNCT = re.compile(r"[^\w\s]")
 _WS = re.compile(r"\s+")
 
 
+def collapse_ws(text) -> str:
+    """Join wrapped lines and collapse repeated whitespace into single spaces,
+    then trim. Formatting-mismatch guard: questions that differ only by line
+    breaks or spacing become identical strings before fuzzy matching."""
+    if text is None:
+        return ""
+    return _WS.sub(" ", str(text)).strip()
+
+
 def norm_match(text: str) -> str:
-    """Aggressive normalisation used for fuzzy clustering: drop leading
-    numbering, lowercase, strip punctuation, collapse whitespace."""
+    """Aggressive normalisation used for fuzzy clustering: collapse line
+    breaks/whitespace first, then drop leading numbering, strip punctuation
+    and lowercase."""
     if not text:
         return ""
-    t = str(text)
+    t = collapse_ws(text)
     prev = None
     # strip possibly-repeated leading numbering ("Q1 a) ...")
     while prev != t:
