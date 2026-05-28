@@ -132,12 +132,20 @@ def build_workbook() -> openpyxl.Workbook:
     row = answer_box  (ws, row, "SFC & HKMA")
     row += 1
 
-    # Q3 - multiple sub-labels (italic) each with its own answer
+    # Q3 - labelled-section question: a short title stem with two labelled
+    # sections. HK is filled with a multi-line list answer; Singapore shows only
+    # a placeholder hint and is left blank. A large gap separates the sections.
     row = question_row(ws, row, "Q3", "Relevant Authorised Activities")
     row = italic_label(ws, row, "For HK, please specify license type")
-    row = answer_box  (ws, row, "Type 1 & Type 4")
+    row = answer_box  (ws, row,
+        "Authorized Institution - HKMA\n"
+        "Dealing in Securities - SFC\n"
+        "Advising on Securities - SFC\n"
+        "Advising on Securities - SFC")
+    row += 6  # large vertical gap between sections
     row = italic_label(ws, row, "For Singapore, please specify license type")
-    row = answer_box  (ws, row, "N/A")
+    row = italic_label(ws, row, "Please detail the license type and conditions.")
+    row = answer_box  (ws, row, "")  # placeholder only — left blank
     row += 1
 
     # Q4 - hint + answer
