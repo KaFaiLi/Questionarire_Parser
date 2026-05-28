@@ -28,10 +28,16 @@ directly, in which case the xlsx→pdf step is skipped.)
 Outputs
 -------
 For each input file, in ``--output-dir``:
-    <name>.json       – list of {question_id, question, answer, source_pages}
+    <name>.json       – {file_name, questions:[{question_id, question,
+                         sub_questions:[{option_label, prompt, selection,
+                         answer, answer_source}], source_pages}]}. Each
+                         answerable part of a question (multi-part 'a)/b)',
+                         a YES/NO branch, a single free-text box) is its own
+                         sub-question so selections and answers never have to
+                         be collapsed into one field.
     <name>.pdf        – the intermediate PDF (kept for inspection / debugging)
 And a combined:
-    <stem>.xlsx       – one row per question across all inputs
+    <stem>.xlsx       – one row per sub-question across all inputs
 
 Environment
 -----------
@@ -108,6 +114,51 @@ DEFAULT_MAX_ATTEMPTS = 4
 DEFAULT_RETRY_BASE_DELAY = 2.0  # seconds; doubles each attempt
 
 # ─── Data model the LLM must return ─────────────────────────────────────────
+class SubQuestion(BaseModel):
+    """One answerable part of a question.
+
+    A single question id often bundles several of these: multi-part questions
+    ('a) …', 'b) …'), branch/option rows (e.g. 'Settling distributor' vs
+    'Non-settling distributor'), or just a single free-text box. Splitting them
+    out means the LLM never has to pick one sub-part or merge several selections
+    and answers into a single string.
+    """
+    option_label: str = Field(
+        default="",
+        description=(
+            "The choice/branch this sub-question belongs to, exactly as printed "
+            "(e.g. 'Settling distributor', 'Non-settling distributor'). Empty "
+            "string if the sub-question is not under a labelled option."
+        ),
+    )
+    prompt: str = Field(
+        default="",
+        description=(
+            "The text of this specific sub-question / follow-up prompt (e.g. "
+            "'Who is the custodian?' or 'b) Does each product go through the "
+            "same approval process?'). For a plain question with a single "
+            "answer box and no distinct sub-parts, leave this empty — the "
+            "stem `question` already holds the text."
+        ),
+    )
+    selection: str = Field(
+        default="",
+        description=(
+            "The respondent's selected control for this sub-question: a side "
+            "dropdown value (e.g. 'YES' / 'NO'), a ticked checkbox/radio label, "
+            "or a highlighted choice. Empty string if there is no selectable "
+            "control or none was chosen. Never put free text here."
+        ),
+    )
+    answer: str = Field(
+        default="",
+        description=(
+            "The respondent's free-text answer written in this sub-question's "
+            "answer box. Empty string if the box is blank. Keep this separate "
+            "from `selection`, and do not copy the prompt into it."
+        ),
+    )
+
 class QA(BaseModel):
     question_id: str = Field(
         description=(
@@ -118,18 +169,20 @@ class QA(BaseModel):
     )
     question: str = Field(
         description=(
-            "The full question text, including any sub-prompts, italic hints, "
-            "branch labels, or option labels that belong to it. Preserve "
-            "newlines between sub-prompts."
+            "The main/stem question text exactly as printed next to the "
+            "question id (e.g. 'In which capacity will your firm act as "
+            "distributor?'). Do NOT fold sub-prompts or option labels into "
+            "this field — those belong in `sub_questions`."
         )
     )
-    answer: str = Field(
+    sub_questions: list[SubQuestion] = Field(
+        default_factory=list,
         description=(
-            "The respondent's answer text as written in the answer box / "
-            "dropdown. Empty string if the answer box is blank. If there is "
-            "both a side-dropdown (YES/NO) and a free-text answer, join them "
-            "with ' - ' (e.g. 'YES - Acme Bank')."
-        )
+            "Every answerable part of this question, in the order it appears: "
+            "one entry per option/branch row, per multi-part sub-question "
+            "('a)…','b)…'), or — for a plain single-answer question — a single "
+            "entry carrying just the answer."
+        ),
     )
 
 class QAList(BaseModel):
@@ -327,22 +380,38 @@ SYSTEM_PROMPT = (
     "two consecutive pages at once so that questions spanning the page break "
     "are fully visible. "
     "Identify every question that has a printed question id (e.g. 'Q1', "
-    "'Q12.a', '3.2'), and return its full question text and the respondent's "
-    "answer. "
-    "Rules:\n"
+    "'Q12.a', '3.2'), and return its stem text plus a list of sub_questions, "
+    "each carrying its own selection and answer.\n"
+    "Filling sub_questions:\n"
+    "- A question often bundles several answerable parts. Return ONE "
+    "  sub_question per part, in the order they appear — never collapse them "
+    "  into one field and never pick just one part.\n"
+    "- Multi-part questions ('a) …', 'b) …'): one sub_question per part, with "
+    "  that part's text in `prompt` and its own `answer`.\n"
+    "- Branch / option rows (e.g. 'Settling distributor' vs 'Non-settling "
+    "  distributor'): one sub_question per option. Put the option text in "
+    "  `option_label`, any follow-up prompt (e.g. 'Who is the custodian?') in "
+    "  `prompt`, the chosen YES/NO (or ticked) value in `selection`, and the "
+    "  free text the respondent wrote in `answer`.\n"
+    "- A plain question with a single answer box and no distinct sub-parts: "
+    "  return exactly one sub_question with empty `option_label`, `prompt`, "
+    "  and `selection`, and the respondent's text in `answer`.\n"
+    "Field rules:\n"
+    "- `selection` is only for a chosen control (dropdown like YES/NO, a "
+    "  ticked checkbox/radio, a highlighted option). Never put free text in "
+    "  `selection`.\n"
+    "- `answer` is only what the respondent wrote/typed. If an answer box is "
+    "  empty, use an empty string — do not guess or copy the prompt.\n"
+    "- Keep `question` to just the stem printed next to the id; do not fold "
+    "  sub-prompts or option labels into it.\n"
+    "Coverage rules:\n"
     "- Only return a question if its id is fully visible. If an id is on the "
-    "  first image and its answer continues on the second image, return the "
-    "  complete merged item. If an id starts at the very bottom and its body "
-    "  is cut off (not visible on either image in this window), skip it — "
+    "  first image and its body/answers continue on the second image, return "
+    "  the complete merged item. If an id starts at the very bottom and its "
+    "  body is cut off (not visible on either image in this window), skip it — "
     "  another window will see it in full.\n"
-    "- 'answer' must contain only what the respondent wrote (free text, "
-    "  dropdown selection, ticked option). If the answer box is empty, use "
-    "  an empty string.\n"
-    "- If a question has both a side dropdown (YES/NO etc.) and a free-text "
-    "  box, join them with ' - ' (e.g. 'YES - Acme Bank').\n"
-    "- Preserve newlines inside the question text when sub-prompts / hints "
-    "  appear on separate lines.\n"
-    "- Do not invent ids, questions, or answers. Do not summarise.\n"
+    "- Preserve newlines inside long prompts or answers.\n"
+    "- Do not invent ids, questions, selections, or answers. Do not summarise.\n"
 )
 
 def build_llm(model_kwargs: dict | None = None) -> AzureChatOpenAI:
@@ -444,17 +513,28 @@ def extract_from_window(
         SystemMessage(content=SYSTEM_PROMPT),
         HumanMessage(content=user_content),
     ])
-    return [
-        {
-            "question_id":   q.question_id.strip(),
+    items: list[dict] = []
+    for q in result.questions:
+        qid = q.question_id.strip()
+        if not qid:
+            continue
+        sub_questions = [
+            {
+                "option_label":  sq.option_label.strip(),
+                "prompt":        sq.prompt.strip(),
+                "selection":     sq.selection.strip(),
+                "answer":        sq.answer.strip(),
+                "answer_source": "llm",
+            }
+            for sq in q.sub_questions
+        ]
+        items.append({
+            "question_id":   qid,
             "question":      q.question.strip(),
-            "answer":        q.answer.strip(),
+            "sub_questions": sub_questions,
             "source_pages":  list(page_numbers),
-            "answer_source": "llm",
-        }
-        for q in result.questions
-        if q.question_id.strip()
-    ]
+        })
+    return items
 
 # ─── Sliding window + dedup ─────────────────────────────────────────────────
 def iter_windows(n_pages: int, window: int, stride: int) -> Iterable[list[int]]:
@@ -471,11 +551,18 @@ def iter_windows(n_pages: int, window: int, stride: int) -> Iterable[list[int]]:
     for s in starts:
         yield list(range(s, s + window))
 
-def _completeness(item: dict) -> tuple[int, int]:
-    """Score used to pick the better duplicate. Prefer non-empty answers, then
-    longer question text, then longer answer text."""
-    has_answer = 1 if item["answer"] else 0
-    return (has_answer, len(item["question"]) + len(item["answer"]))
+def _completeness(item: dict) -> tuple[int, int, int]:
+    """Score used to pick the better duplicate. Prefer the variant with more
+    filled sub-questions (a non-empty selection or answer), then more
+    sub-questions, then more total text."""
+    subs = item.get("sub_questions", [])
+    n_filled = sum(1 for s in subs if s.get("selection") or s.get("answer"))
+    text_len = len(item.get("question", "")) + sum(
+        len(s.get("option_label", "")) + len(s.get("prompt", ""))
+        + len(s.get("selection", "")) + len(s.get("answer", ""))
+        for s in subs
+    )
+    return (n_filled, len(subs), text_len)
 
 def dedupe_by_id(items: list[dict]) -> list[dict]:
     """Dedup keyed by (sheet, question_id): the same Q-id can appear on two
@@ -508,14 +595,14 @@ def dedupe_by_id(items: list[dict]) -> list[dict]:
 def _normalise(s: str) -> str:
     return " ".join(s.split()).casefold()
 
-def _collect_xlsx_answers(xlsx_path: Path) -> dict[tuple[str, str], str]:
-    """(sheet_name, qid) → full answer text, by scanning the source xlsx
-    with openpyxl. Same notion of "answer cell" as parse.py: grey/yellow
-    fill in the B:AO content band, attributed to the most recent Q-id on
-    that sheet. Multiple answer cells for the same Q-id are joined with
-    newlines."""
+def _collect_xlsx_answers(xlsx_path: Path) -> dict[tuple[str, str], list[str]]:
+    """(sheet_name, qid) → ordered list of non-empty answer-cell texts, by
+    scanning the source xlsx with openpyxl. Same notion of "answer cell" as
+    parse.py: grey/yellow fill in the B:AO content band, attributed to the
+    most recent Q-id on that sheet. Returned in document order so they can be
+    matched positionally to a question's sub_questions."""
     wb = openpyxl.load_workbook(xlsx_path, data_only=True)
-    answers: dict[tuple[str, str], str] = {}
+    answers: dict[tuple[str, str], list[str]] = {}
 
     for ws in wb.worksheets:
         sheet_name = ws.title
@@ -544,42 +631,60 @@ def _collect_xlsx_answers(xlsx_path: Path) -> dict[tuple[str, str], str]:
                     continue
                 if classify_fill(cell) in ANSWER_FILLS:
                     key = (sheet_name, current_qid)
-                    existing = answers.get(key, "")
-                    answers[key] = (
-                        existing + "\n" + text if existing else text
-                    )
+                    answers.setdefault(key, []).append(text)
     return answers
+
+def _looks_truncated(llm_ans: str, truth: str) -> bool:
+    """True when the LLM answer is a prefix of the xlsx text and the xlsx has
+    materially more content — the signature of a vision-model truncation."""
+    truth_n = _normalise(truth)
+    llm_n   = _normalise(llm_ans)
+    return truth_n.startswith(llm_n) and len(truth_n) > len(llm_n) + 5
 
 def reconcile_with_xlsx(
     items: list[dict], xlsx_path: Path
 ) -> tuple[list[dict], int]:
-    """Replace LLM answers that look truncated with the full text from the
-    source xlsx. Matches by (sheet, question_id). Modifies items in place
+    """Repair LLM sub-question answers that look truncated (or were missed)
+    using the full text from the source xlsx. Matches by (sheet, question_id),
+    then positionally between the xlsx's ordered answer cells and the question's
+    sub_questions. Conservative: only acts when the counts line up, so an
+    ambiguous mismatch leaves the LLM output untouched. Modifies items in place
     and returns them, plus the count of substitutions made."""
     answers = _collect_xlsx_answers(xlsx_path)
     n_reconciled = 0
 
     for item in items:
-        item.setdefault("answer_source", "llm")
-        truth = answers.get((item.get("sheet", ""), item["question_id"]))
-        if not truth:
+        truths = answers.get((item.get("sheet", ""), item["question_id"]))
+        if not truths:
             continue
+        subs = item.setdefault("sub_questions", [])
+        answered = [s for s in subs if s.get("answer")]
 
-        llm_ans = item["answer"]
-        if not llm_ans:
-            item["answer"] = truth
-            item["answer_source"] = "xlsx_reconciled"
+        if answered and len(answered) == len(truths):
+            # Fix truncations on the answers the LLM did capture.
+            for s, truth in zip(answered, truths):
+                if _looks_truncated(s["answer"], truth):
+                    s["answer"] = truth
+                    s["answer_source"] = "xlsx_reconciled"
+                    n_reconciled += 1
+        elif not answered and subs and len(subs) == len(truths):
+            # LLM saw the sub-questions but missed every answer; fill in order.
+            for s, truth in zip(subs, truths):
+                s["answer"] = truth
+                s["answer_source"] = "xlsx_reconciled"
+                n_reconciled += 1
+        elif not answered and len(truths) == 1 and len(subs) <= 1:
+            # Simple single-answer question the LLM left blank (or split into
+            # no sub-questions at all).
+            if not subs:
+                subs.append({
+                    "option_label": "", "prompt": "", "selection": "",
+                    "answer": "", "answer_source": "llm",
+                })
+            subs[0]["answer"] = truths[0]
+            subs[0]["answer_source"] = "xlsx_reconciled"
             n_reconciled += 1
-            continue
-
-        truth_n = _normalise(truth)
-        llm_n   = _normalise(llm_ans)
-        # Truncation signature: the LLM's answer is a prefix of the xlsx
-        # cell's full text, and the xlsx has materially more content.
-        if truth_n.startswith(llm_n) and len(truth_n) > len(llm_n) + 5:
-            item["answer"] = truth
-            item["answer_source"] = "xlsx_reconciled"
-            n_reconciled += 1
+        # else: ambiguous count mismatch — leave the LLM output as-is.
 
     return items, n_reconciled
 
@@ -665,8 +770,12 @@ def parse_one(
     return ParseResult(file_name=src.stem, items=merged)
 
 # ─── Writers ────────────────────────────────────────────────────────────────
+# One row per sub-question. Column names match parse.py's flattened schema
+# (question / option_label / prompt / side_answer / answer) so the downstream
+# analysers (analyze.py, analyze_llm_xlsx.py) read this output unchanged.
 XLSX_FIELDS = [
-    "file_name", "sheet", "question_id", "question", "answer",
+    "file_name", "sheet", "question_id", "sub_idx", "question",
+    "option_label", "prompt", "side_answer", "answer",
     "answer_source", "source_pages",
 ]
 
@@ -679,6 +788,14 @@ def write_json(result: ParseResult, path: Path) -> None:
         encoding="utf-8",
     )
 
+def _row_question_text(stem: str, sub: dict) -> str:
+    """Per-row question text: the stem, with this sub-question's prompt appended
+    so multi-part questions stay distinguishable when flattened."""
+    prompt = sub.get("prompt", "")
+    if prompt and prompt != stem:
+        return f"{stem} — {prompt}" if stem else prompt
+    return stem
+
 def write_xlsx(results: list[ParseResult], path: Path) -> None:
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -686,15 +803,24 @@ def write_xlsx(results: list[ParseResult], path: Path) -> None:
     ws.append(XLSX_FIELDS)
     for r in results:
         for it in r.items:
-            ws.append([
-                r.file_name,
-                it.get("sheet", ""),
-                it["question_id"],
-                it["question"],
-                it["answer"],
-                it.get("answer_source", "llm"),
-                ", ".join(map(str, it["source_pages"])),
-            ])
+            stem = it.get("question", "")
+            pages = ", ".join(map(str, it.get("source_pages", [])))
+            # A question with no sub_questions still emits one (empty) row.
+            subs = it.get("sub_questions") or [{}]
+            for idx, sub in enumerate(subs):
+                ws.append([
+                    r.file_name,
+                    it.get("sheet", ""),
+                    it["question_id"],
+                    idx,
+                    _row_question_text(stem, sub),
+                    sub.get("option_label", ""),
+                    sub.get("prompt", ""),
+                    sub.get("selection", ""),
+                    sub.get("answer", ""),
+                    sub.get("answer_source", "llm"),
+                    pages,
+                ])
     wb.save(path)
 
 # ─── CLI ────────────────────────────────────────────────────────────────────
