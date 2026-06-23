@@ -346,6 +346,56 @@ def make_matrix(df, path, ct, dt):
                    full_html=True, default_width=f"{width}px", default_height=f"{height}px")
 
 
+def make_outlier_matrix(df_out, df_flags, slots, canon, path, ocfg):
+    """Heatmap: files (rows) x answer-slots (cols). green=answered, red=outlier, blank=missing."""
+    import plotly.graph_objects as go
+    from collections import Counter
+
+    slot_ids = sorted(slots)
+    dom_qid = {sid: Counter(r["question_id"] for r in slots[sid]).most_common(1)[0][0]
+               for sid in slot_ids}
+    files = sorted(df_flags["file_name"])
+    flagged = set(df_flags[df_flags["flagged"]]["file_name"])
+    outset = {(r.file_name, r.slot_id) for r in df_out.itertuples()}
+    resp = {(r["file_name"], sid): r["response"]
+            for sid in slot_ids for r in slots[sid]}
+
+    xlabels = [f"{dom_qid[sid]} <span style='color:#999'>(s{sid})</span>" for sid in slot_ids]
+    z, hover = [], []
+    for f in files:
+        zr, hr = [], []
+        for sid in slot_ids:
+            if (f, sid) not in resp:
+                zr.append(None); hr.append("")
+            elif (f, sid) in outset:
+                zr.append(2); hr.append(f"<b>{f}</b> · {dom_qid[sid]}<br>OUTLIER: {resp[(f, sid)]}")
+            else:
+                zr.append(0); hr.append(f"{f} · {dom_qid[sid]}<br>{resp[(f, sid)]}")
+        z.append(zr); hover.append(hr)
+
+    ylabels = [("⚑ " + f) if f in flagged else f for f in files]
+    colorscale = [[0.0, "#2e7d32"], [0.5, "#2e7d32"], [0.5, "#c62828"], [1.0, "#c62828"]]
+    fig = go.Figure(go.Heatmap(
+        z=z, x=xlabels, y=ylabels, customdata=hover,
+        hovertemplate="%{customdata}<extra></extra>",
+        zmin=0, zmax=2, colorscale=colorscale, showscale=False, xgap=1, ygap=1))
+    cell_w, cell_h = 60, 22
+    width = 260 + cell_w * len(slot_ids)
+    height = 200 + cell_h * len(files)
+    n_flag = len(flagged)
+    fig.update_layout(
+        title={"text": (f"<b>Answer outliers</b> — {n_flag} flagged questionnaire(s) "
+                        f"(≥{ocfg['multi_outlier_n']} outliers)<br>"
+                        f"<sub>red = outlier answer · ⚑ = flagged file · hover for value</sub>"),
+               "x": 0, "xanchor": "left", "y": 0.985, "yanchor": "top", "font": {"size": 16}},
+        xaxis={"side": "top", "tickangle": -45, "tickfont": {"size": 11}, "showgrid": False, "ticks": ""},
+        yaxis={"autorange": "reversed", "tickfont": {"size": 11}, "showgrid": False, "ticks": ""},
+        width=width, height=height, margin={"l": 200, "r": 80, "t": 170, "b": 20},
+        plot_bgcolor="white", font={"family": "system-ui,sans-serif"})
+    fig.write_html(str(path), include_plotlyjs="cdn",
+                   full_html=True, default_width=f"{width}px", default_height=f"{height}px")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--in", dest="in_dir", default="output/llm_parsed_full2", help="dir of parsed *.json")
@@ -407,8 +457,9 @@ def main() -> None:
         df_flags.to_excel(xl, sheet_name="questionnaire_flags", index=False)
 
     html_out = out.with_suffix(".html")
+    outlier_html = out.with_name("drift_analysis_outliers.html")
     make_matrix(df, html_out, ct, dt)
-    # make_outlier_matrix(df_out, df_flags, slots, canon, out.with_name("drift_analysis_outliers.html"), ocfg)  # Task 6
+    make_outlier_matrix(df_out, df_flags, slots, canon, outlier_html, ocfg)
 
     n_clusters = df["cluster_id"].nunique()
     n_drift = int(df["is_drift"].sum())
@@ -417,7 +468,7 @@ def main() -> None:
     print(f"outliers: {len(outliers)} answers  |  flagged questionnaires: "
           f"{int(df_flags['flagged'].sum())}/{len(df_flags)} (min_votes={ocfg['min_votes']}, "
           f"multi_outlier_n={ocfg['multi_outlier_n']})")
-    print(f"wrote {out}\nwrote {html_out}")
+    print(f"wrote {out}\nwrote {html_out}\nwrote {outlier_html}")
 
 
 if __name__ == "__main__":
