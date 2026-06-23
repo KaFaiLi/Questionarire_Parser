@@ -118,40 +118,49 @@ def cos(a, b) -> float:
     return float(a @ b / ((np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12))
 
 
-def build_rows(units: list[dict], vecs: dict, cluster_threshold: float, drift_threshold: float) -> list[dict]:
+def assign_clusters(units: list[dict], vecs: dict, ct: float):
+    """One clustering pass. Returns (assign, canon):
+    assign: (level, text) -> global cluster id; canon: cid -> canonical (most-frequent) text."""
     from collections import Counter
-
-    rows = []
+    assign, canon = {}, {}
     next_cid = 0
     for level in sorted({u["level"] for u in units}):
         lvl_units = [u for u in units if u["level"] == level]
-        texts = [u["text"] for u in lvl_units]
-        local = cluster(texts, vecs, cluster_threshold)
-        # group units by local cluster id
-        groups: dict[int, list[dict]] = {}
+        local = cluster([u["text"] for u in lvl_units], vecs, ct)
+        groups = {}
         for u in lvl_units:
             groups.setdefault(local[u["text"]], []).append(u)
         for _, gunits in sorted(groups.items()):
             cid = next_cid
             next_cid += 1
             counts = Counter(u["text"] for u in gunits)
-            # canonical: most frequent, tie -> longest, then alphabetical
-            canonical = sorted(counts, key=lambda t: (-counts[t], -len(t), t))[0]
-            dom_qid = Counter(u["question_id"] for u in gunits).most_common(1)[0][0]
+            canon[cid] = sorted(counts, key=lambda t: (-counts[t], -len(t), t))[0]
             for u in gunits:
-                sim_c = 1.0 if u["text"] == canonical else cos(vecs[u["text"]], vecs[canonical])
-                is_canon = u["text"] == canonical
-                rows.append({
-                    "cluster_id": cid,
-                    "level": level,
-                    "question_id": dom_qid,
-                    "file_name": u["file_name"],
-                    "variant_text": u["text"],
-                    "is_canonical": is_canon,
-                    "is_drift": (not is_canon) and sim_c < drift_threshold,
-                    "occurrences": counts[u["text"]],
-                    "cosine_to_canonical": round(sim_c, 4),
-                })
+                assign[(level, u["text"])] = cid
+    return assign, canon
+
+
+def build_rows(units: list[dict], vecs: dict, assign: dict, canon: dict, drift_threshold: float) -> list[dict]:
+    from collections import Counter
+    by_cid = {}
+    for u in units:
+        by_cid.setdefault(assign[(u["level"], u["text"])], []).append(u)
+    rows = []
+    for cid, gunits in sorted(by_cid.items()):
+        canonical = canon[cid]
+        counts = Counter(u["text"] for u in gunits)
+        dom_qid = Counter(u["question_id"] for u in gunits).most_common(1)[0][0]
+        level = gunits[0]["level"]
+        for u in gunits:
+            is_canon = u["text"] == canonical
+            sim_c = 1.0 if is_canon else cos(vecs[u["text"]], vecs[canonical])
+            rows.append({
+                "cluster_id": cid, "level": level, "question_id": dom_qid,
+                "file_name": u["file_name"], "variant_text": u["text"],
+                "is_canonical": is_canon,
+                "is_drift": (not is_canon) and sim_c < drift_threshold,
+                "occurrences": counts[u["text"]], "cosine_to_canonical": round(sim_c, 4),
+            })
     return rows
 
 
@@ -265,7 +274,8 @@ def main() -> None:
     embeddings = make_embeddings(cfg)
     vecs = embed_texts([u["text"] for u in units], embeddings, args.workers, Path(args.cache))
 
-    rows = build_rows(units, vecs, ct, dt)
+    assign, canon = assign_clusters(units, vecs, ct)
+    rows = build_rows(units, vecs, assign, canon, dt)
 
     import pandas as pd
     df = pd.DataFrame(rows).sort_values(
