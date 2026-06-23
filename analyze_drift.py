@@ -354,6 +354,9 @@ def main() -> None:
     ap.add_argument("--cache", default="output/.vec_cache.json", help="vector cache (text->embedding)")
     ap.add_argument("--cluster-threshold", type=float, help="override config drift.cluster_threshold")
     ap.add_argument("--drift-threshold", type=float, help="override config drift.drift_threshold")
+    ap.add_argument("--min-votes", type=int, help="override outliers.min_votes")
+    ap.add_argument("--multi-outlier-n", type=int, help="override outliers.multi_outlier_n")
+    ap.add_argument("--answer-threshold", type=float, help="override outliers.answer_threshold")
     args = ap.parse_args()
 
     cfg = load_config()
@@ -367,26 +370,53 @@ def main() -> None:
     print(f"{len(units)} units from {len(set(u['file_name'] for u in units))} files; "
           f"{len(set(u['text'] for u in units))} distinct strings")
 
+    ocfg = dict(cfg["outliers"])
+    if args.min_votes is not None: ocfg["min_votes"] = args.min_votes
+    if args.multi_outlier_n is not None: ocfg["multi_outlier_n"] = args.multi_outlier_n
+    if args.answer_threshold is not None: ocfg["answer_threshold"] = args.answer_threshold
+
+    answer_recs = extract_answers(in_dir)
+
     embeddings = make_embeddings(cfg)
-    vecs = embed_texts([u["text"] for u in units], embeddings, args.workers, Path(args.cache))
+    all_texts = [u["text"] for u in units] + [r["response"] for r in answer_recs]
+    vecs = embed_texts(all_texts, embeddings, args.workers, Path(args.cache))
 
     assign, canon = assign_clusters(units, vecs, ct)
     rows = build_rows(units, vecs, assign, canon, dt)
+
+    slots = group_by_slot(answer_recs, assign)
+    outliers = detect_outliers(slots, vecs, ocfg)
+    all_files = sorted({r["file_name"] for r in answer_recs})
+    flags = flag_questionnaires(outliers, all_files, ocfg["multi_outlier_n"])
 
     import pandas as pd
     df = pd.DataFrame(rows).sort_values(
         ["cluster_id", "is_canonical", "file_name"], ascending=[True, False, True])
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    df.to_excel(out, sheet_name="drift", index=False)
+
+    OUT_COLS = ["slot_id", "question_id", "file_name", "response", "votes",
+                "methods_fired", "freq_share", "cluster_share", "centroid_z"]
+    df_out = pd.DataFrame(outliers, columns=OUT_COLS).sort_values(
+        ["file_name", "question_id"]) if outliers else pd.DataFrame(columns=OUT_COLS)
+    df_flags = pd.DataFrame(flags, columns=["file_name", "n_outliers", "flagged", "questions"])
+
+    with pd.ExcelWriter(out) as xl:
+        df.to_excel(xl, sheet_name="drift", index=False)
+        df_out.to_excel(xl, sheet_name="answer_outliers", index=False)
+        df_flags.to_excel(xl, sheet_name="questionnaire_flags", index=False)
 
     html_out = out.with_suffix(".html")
     make_matrix(df, html_out, ct, dt)
+    # make_outlier_matrix(df_out, df_flags, slots, canon, out.with_name("drift_analysis_outliers.html"), ocfg)  # Task 6
 
     n_clusters = df["cluster_id"].nunique()
     n_drift = int(df["is_drift"].sum())
     print(f"clusters: {n_clusters}  |  drift rows: {n_drift}  "
           f"(cluster_threshold={ct}, drift_threshold={dt})")
+    print(f"outliers: {len(outliers)} answers  |  flagged questionnaires: "
+          f"{int(df_flags['flagged'].sum())}/{len(df_flags)} (min_votes={ocfg['min_votes']}, "
+          f"multi_outlier_n={ocfg['multi_outlier_n']})")
     print(f"wrote {out}\nwrote {html_out}")
 
 
