@@ -15,4 +15,5 @@ dependencies = [
     "langchain-openai>=0.2",
     "pydantic>=2.0",
     "pywin32>=306; sys_platform == 'win32'",
+    "plotly>=6.8.0",
 ]

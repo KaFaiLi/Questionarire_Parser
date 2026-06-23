@@ -13,3 +13,8 @@ wheels/
 *.csv
 *.json
 *.pdf
+
+config.yaml
+*.html
+
+*docs/

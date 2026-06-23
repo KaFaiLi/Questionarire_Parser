@@ -1,0 +1,288 @@
+"""Cluster questionnaire wordings and flag question drift across parsed JSONs.
+
+Embeds every template string (question text, sub-question prompt, option_label) with
+Azure embeddings via LangChain, clusters semantically-equal variants, derives a canonical
+wording per cluster (most frequent), and flags drift. Output: one Excel tab, one row per
+(file, variant) so you can see which file carries which wording.
+
+    uv run python analyze_drift.py --in output/llm_parsed_full2 -o output/drift_analysis.xlsx
+
+Config (endpoint / key / embedding deployment / thresholds) comes from config.yaml.
+Tune --cluster-threshold (merges wordings into one logical question) and --drift-threshold
+(flags a variant as real drift) by reviewing the Excel.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+from pathlib import Path
+
+import yaml
+
+FIELDS_TEXT = {"prompt": "prompt", "option_label": "option"}  # sub-question field -> level
+
+
+def load_config(path: str = "config.yaml") -> dict:
+    return yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip().lower()
+
+
+def make_embeddings(cfg: dict):
+    from langchain_openai import AzureOpenAIEmbeddings
+    az = cfg["azure"]
+    return AzureOpenAIEmbeddings(
+        azure_endpoint=az["endpoint"],
+        azure_deployment=az["embedding_deployment"],
+        api_version=az["api_version"],
+        api_key=az["api_key"],
+    )
+
+
+def extract_units(in_dir: Path) -> list[dict]:
+    """One unit per non-empty template string (question / prompt / option_label)."""
+    units = []
+    for p in sorted(in_dir.glob("*.json")):
+        data = json.loads(p.read_text(encoding="utf-8"))
+        fname = data.get("file_name", p.stem)
+        for q in data.get("questions", []):
+            qid = q.get("question_id", "")
+            if (q.get("question") or "").strip():
+                units.append({"file_name": fname, "question_id": qid, "sub_idx": None,
+                              "level": "question", "text": q["question"]})
+            for i, s in enumerate(q.get("sub_questions", [])):
+                for field, level in FIELDS_TEXT.items():
+                    if (s.get(field) or "").strip():
+                        units.append({"file_name": fname, "question_id": qid, "sub_idx": i,
+                                      "level": level, "text": s[field]})
+    return units
+
+
+def embed_texts(texts: list[str], embeddings, workers: int, cache_path: Path) -> dict[str, list[float]]:
+    """Embed each distinct text once, multithreaded. Cached to cache_path (text->vector JSON)
+    so repeat runs are reproducible and only new strings hit the API."""
+    from concurrent.futures import ThreadPoolExecutor
+    from tqdm import tqdm
+
+    vecs: dict[str, list[float]] = {}
+    if cache_path.exists():
+        vecs = json.loads(cache_path.read_text(encoding="utf-8"))
+    uniq = sorted(set(texts))
+    todo = [t for t in uniq if t not in vecs]
+    if todo:
+        batch = 64
+        batches = [todo[i:i + batch] for i in range(0, len(todo), batch)]
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for b, res in tqdm(zip(batches, ex.map(embeddings.embed_documents, batches)),
+                               total=len(batches), desc="embedding"):
+                vecs.update(zip(b, res))
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(vecs), encoding="utf-8")
+    print(f"embeddings: {len(todo)} new, {len(uniq) - len(todo)} cached  ({cache_path})")
+    return {t: vecs[t] for t in uniq}
+
+
+def cluster(texts: list[str], vecs: dict[str, list[float]], threshold: float) -> dict[str, int]:
+    """Single-linkage union-find on cosine sim. Returns text -> cluster id (per call)."""
+    import numpy as np
+
+    uniq = sorted(set(texts))
+    if not uniq:
+        return {}
+    M = np.array([vecs[t] for t in uniq], dtype=float)
+    M /= (np.linalg.norm(M, axis=1, keepdims=True) + 1e-12)
+    sim = M @ M.T
+
+    parent = list(range(len(uniq)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    # ponytail: numpy union-find single-linkage, small N. Swap to sklearn AgglomerativeClustering if chaining becomes a problem.
+    for i in range(len(uniq)):
+        for j in range(i + 1, len(uniq)):
+            if sim[i, j] >= threshold:
+                parent[find(i)] = find(j)
+    return {t: find(i) for i, t in enumerate(uniq)}
+
+
+def cos(a, b) -> float:
+    import numpy as np
+    a, b = np.array(a, dtype=float), np.array(b, dtype=float)
+    return float(a @ b / ((np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12))
+
+
+def build_rows(units: list[dict], vecs: dict, cluster_threshold: float, drift_threshold: float) -> list[dict]:
+    from collections import Counter
+
+    rows = []
+    next_cid = 0
+    for level in sorted({u["level"] for u in units}):
+        lvl_units = [u for u in units if u["level"] == level]
+        texts = [u["text"] for u in lvl_units]
+        local = cluster(texts, vecs, cluster_threshold)
+        # group units by local cluster id
+        groups: dict[int, list[dict]] = {}
+        for u in lvl_units:
+            groups.setdefault(local[u["text"]], []).append(u)
+        for _, gunits in sorted(groups.items()):
+            cid = next_cid
+            next_cid += 1
+            counts = Counter(u["text"] for u in gunits)
+            # canonical: most frequent, tie -> longest, then alphabetical
+            canonical = sorted(counts, key=lambda t: (-counts[t], -len(t), t))[0]
+            dom_qid = Counter(u["question_id"] for u in gunits).most_common(1)[0][0]
+            for u in gunits:
+                sim_c = 1.0 if u["text"] == canonical else cos(vecs[u["text"]], vecs[canonical])
+                is_canon = u["text"] == canonical
+                rows.append({
+                    "cluster_id": cid,
+                    "level": level,
+                    "question_id": dom_qid,
+                    "file_name": u["file_name"],
+                    "variant_text": u["text"],
+                    "is_canonical": is_canon,
+                    "is_drift": (not is_canon) and sim_c < drift_threshold,
+                    "occurrences": counts[u["text"]],
+                    "cosine_to_canonical": round(sim_c, 4),
+                })
+    return rows
+
+
+def _variant_meta(df):
+    """Per cluster, order distinct variants canonical-first and tag status + a Vn id."""
+    import pandas as pd
+    meta = {}  # (cluster_id, text) -> {"vid","status","occ","sim","files"}
+    for cid, sub in df.groupby("cluster_id"):
+        order = (sub.drop_duplicates("variant_text")
+                    .sort_values(["is_canonical", "occurrences"], ascending=[False, False]))
+        for vid, (_, r) in enumerate(order.iterrows()):
+            status = "canon" if r["is_canonical"] else ("drift" if r["is_drift"] else "near")
+            files = sorted(sub[sub["variant_text"] == r["variant_text"]]["file_name"])
+            meta[(cid, r["variant_text"])] = {
+                "vid": vid, "status": status, "occ": int(r["occurrences"]),
+                "sim": float(r["cosine_to_canonical"]), "files": files}
+    return meta
+
+
+def make_matrix(df, path, ct, dt):
+    """Plotly heatmap: files (rows) x question clusters (cols), colored by drift status.
+    Cell text = Vn variant id; hover = full wording + sim + status."""
+    import plotly.graph_objects as go
+
+    meta = _variant_meta(df)
+    STATUS_Z = {"canon": 0, "near": 1, "drift": 2}
+
+    qdf = df[df["level"] == "question"]
+    cols = (qdf.drop_duplicates("cluster_id")
+               .sort_values(["question_id", "cluster_id"])[["cluster_id", "question_id"]]
+               .values.tolist())
+    files = sorted(df["file_name"].unique())
+    xlabels = [f"{q} <span style='color:#999'>(c{cid})</span>" for cid, q in cols]
+
+    z, text, hover = [], [], []
+    for f in files:
+        zr, tr, hr = [], [], []
+        for cid, q in cols:
+            r = qdf[(qdf["cluster_id"] == cid) & (qdf["file_name"] == f)]
+            if r.empty:
+                zr.append(None); tr.append(""); hr.append("")
+                continue
+            txt = r.iloc[0]["variant_text"]
+            m = meta[(cid, txt)]
+            zr.append(STATUS_Z[m["status"]])
+            tr.append(f"V{m['vid']}")
+            hr.append(f"<b>{f}</b> · {q}<br>V{m['vid']} ({m['status']}, sim {m['sim']:.2f})"
+                      f"<br>{txt}")
+        z.append(zr); text.append(tr); hover.append(hr)
+
+    # discrete green/amber/red over z in {0,1,2}
+    colorscale = [[0.0, "#2e7d32"], [0.33, "#2e7d32"],
+                  [0.34, "#f9a825"], [0.66, "#f9a825"],
+                  [0.67, "#c62828"], [1.0, "#c62828"]]
+    # in-cell Vn text gets unreadable past ~40 rows; rely on hover at scale
+    show_text = len(files) <= 40 and len(cols) <= 40
+    fig = go.Figure(go.Heatmap(
+        z=z, x=xlabels, y=files,
+        text=(text if show_text else None),
+        texttemplate=("%{text}" if show_text else None),
+        customdata=hover, hovertemplate="%{customdata}<extra></extra>",
+        zmin=0, zmax=2, colorscale=colorscale,
+        xgap=1, ygap=1, textfont={"size": 10, "color": "#fff"},
+        colorbar={"title": {"text": "status", "side": "right"},
+                  "tickvals": [0.33, 1.0, 1.67], "ticktext": ["canonical", "minor", "drift"],
+                  "thickness": 16, "len": 0.4, "y": 1, "yanchor": "top"}))
+
+    n_drift = int(df["is_drift"].sum())
+    # fixed cell size -> page scrolls at scale (100 files x 30+ questions) instead of squashing
+    cell_w, cell_h = 46, 22
+    width = 260 + cell_w * len(cols)
+    height = 200 + cell_h * len(files)
+    fig.update_layout(
+        title={"text": (f"<b>Question drift</b> — {len(files)} files · "
+                        f"{df['cluster_id'].nunique()} clusters · {n_drift} drift occurrences"
+                        f"<br><sub>cell = wording each file used · hover for full text · "
+                        f"cluster_threshold={ct} drift_threshold={dt}</sub>"),
+               "x": 0, "xanchor": "left", "y": 0.985, "yanchor": "top", "font": {"size": 16}},
+        xaxis={"side": "top", "tickangle": -45, "tickfont": {"size": 11},
+               "showgrid": False, "ticks": "", "constrain": "domain"},
+        yaxis={"autorange": "reversed", "tickfont": {"size": 11},
+               "showgrid": False, "ticks": ""},
+        width=width, height=height,
+        margin={"l": 200, "r": 80, "t": 170, "b": 20},
+        plot_bgcolor="white", font={"family": "system-ui,sans-serif"})
+    fig.write_html(str(path), include_plotlyjs="cdn",
+                   full_html=True, default_width=f"{width}px", default_height=f"{height}px")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--in", dest="in_dir", default="output/llm_parsed_full2", help="dir of parsed *.json")
+    ap.add_argument("-o", "--out", default="output/drift_analysis.xlsx", help="output Excel file")
+    ap.add_argument("--workers", type=int, default=8, help="concurrent embedding requests")
+    ap.add_argument("--cache", default="output/.vec_cache.json", help="vector cache (text->embedding)")
+    ap.add_argument("--cluster-threshold", type=float, help="override config drift.cluster_threshold")
+    ap.add_argument("--drift-threshold", type=float, help="override config drift.drift_threshold")
+    args = ap.parse_args()
+
+    cfg = load_config()
+    ct = args.cluster_threshold if args.cluster_threshold is not None else cfg["drift"]["cluster_threshold"]
+    dt = args.drift_threshold if args.drift_threshold is not None else cfg["drift"]["drift_threshold"]
+
+    in_dir = Path(args.in_dir)
+    units = extract_units(in_dir)
+    if not units:
+        ap.error(f"no template strings found in {in_dir}")
+    print(f"{len(units)} units from {len(set(u['file_name'] for u in units))} files; "
+          f"{len(set(u['text'] for u in units))} distinct strings")
+
+    embeddings = make_embeddings(cfg)
+    vecs = embed_texts([u["text"] for u in units], embeddings, args.workers, Path(args.cache))
+
+    rows = build_rows(units, vecs, ct, dt)
+
+    import pandas as pd
+    df = pd.DataFrame(rows).sort_values(
+        ["cluster_id", "is_canonical", "file_name"], ascending=[True, False, True])
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    df.to_excel(out, sheet_name="drift", index=False)
+
+    html_out = out.with_suffix(".html")
+    make_matrix(df, html_out, ct, dt)
+
+    n_clusters = df["cluster_id"].nunique()
+    n_drift = int(df["is_drift"].sum())
+    print(f"clusters: {n_clusters}  |  drift rows: {n_drift}  "
+          f"(cluster_threshold={ct}, drift_threshold={dt})")
+    print(f"wrote {out}\nwrote {html_out}")
+
+
+if __name__ == "__main__":
+    main()
