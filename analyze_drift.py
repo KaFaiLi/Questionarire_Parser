@@ -61,6 +61,44 @@ def extract_units(in_dir: Path) -> list[dict]:
     return units
 
 
+def extract_answers(in_dir) -> list[dict]:
+    """One record per answered sub-question. anchor = option_label, else prompt, else question
+    text (raw, matching extract_units so the cluster lookup hits). response = answer or selection."""
+    recs = []
+    for p in sorted(Path(in_dir).glob("*.json")):
+        d = json.loads(p.read_text(encoding="utf-8"))
+        fn = d.get("file_name", p.stem)
+        for q in d.get("questions", []):
+            qid = q.get("question_id", "")
+            qtext = q.get("question", "")
+            for i, s in enumerate(q.get("sub_questions", [])):
+                resp = (s.get("answer") or "").strip() or (s.get("selection") or "").strip()
+                if not resp:
+                    continue
+                if (s.get("option_label") or "").strip():
+                    alevel, atext = "option", s["option_label"]
+                elif (s.get("prompt") or "").strip():
+                    alevel, atext = "prompt", s["prompt"]
+                elif qtext.strip():
+                    alevel, atext = "question", qtext
+                else:
+                    continue  # nothing to anchor on
+                recs.append({"file_name": fn, "question_id": qid, "sub_idx": i,
+                             "anchor_level": alevel, "anchor_text": atext, "response": resp})
+    return recs
+
+
+def group_by_slot(answer_recs, assign) -> dict:
+    slots = {}
+    for r in answer_recs:
+        key = (r["anchor_level"], r["anchor_text"])
+        if key not in assign:
+            continue
+        r["slot_id"] = assign[key]
+        slots.setdefault(r["slot_id"], []).append(r)
+    return slots
+
+
 def embed_texts(texts: list[str], embeddings, workers: int, cache_path: Path) -> dict[str, list[float]]:
     """Embed each distinct text once, multithreaded. Cached to cache_path (text->vector JSON)
     so repeat runs are reproducible and only new strings hit the API."""
