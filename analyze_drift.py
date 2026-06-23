@@ -45,7 +45,7 @@ def make_embeddings(cfg: dict):
 def extract_units(in_dir: Path) -> list[dict]:
     """One unit per non-empty template string (question / prompt / option_label)."""
     units = []
-    for p in sorted(in_dir.glob("*.json")):
+    for p in sorted(Path(in_dir).glob("*.json")):
         data = json.loads(p.read_text(encoding="utf-8"))
         fname = data.get("file_name", p.stem)
         for q in data.get("questions", []):
@@ -59,6 +59,104 @@ def extract_units(in_dir: Path) -> list[dict]:
                         units.append({"file_name": fname, "question_id": qid, "sub_idx": i,
                                       "level": level, "text": s[field]})
     return units
+
+
+def extract_answers(in_dir) -> list[dict]:
+    """One record per answered sub-question. anchor = option_label, else prompt, else question
+    text (raw, matching extract_units so the cluster lookup hits). response = answer or selection."""
+    recs = []
+    for p in sorted(Path(in_dir).glob("*.json")):
+        d = json.loads(p.read_text(encoding="utf-8"))
+        fn = d.get("file_name", p.stem)
+        for q in d.get("questions", []):
+            qid = q.get("question_id", "")
+            qtext = q.get("question", "")
+            for i, s in enumerate(q.get("sub_questions", [])):
+                resp = (s.get("answer") or "").strip() or (s.get("selection") or "").strip()
+                if not resp:
+                    continue
+                if (s.get("option_label") or "").strip():
+                    alevel, atext = "option", s["option_label"]
+                elif (s.get("prompt") or "").strip():
+                    alevel, atext = "prompt", s["prompt"]
+                elif qtext.strip():
+                    alevel, atext = "question", qtext
+                else:
+                    continue  # nothing to anchor on
+                recs.append({"file_name": fn, "question_id": qid, "sub_idx": i,
+                             "anchor_level": alevel, "anchor_text": atext, "response": resp})
+    return recs
+
+
+def group_by_slot(answer_recs, assign) -> dict:
+    slots = {}
+    for r in answer_recs:
+        key = (r["anchor_level"], r["anchor_text"])
+        if key not in assign:
+            continue
+        r["slot_id"] = assign[key]
+        slots.setdefault(r["slot_id"], []).append(r)
+    return slots
+
+
+def detect_outliers(slots, vecs, cfg) -> list[dict]:
+    """Per slot, vote across freq / minority-cluster / centroid-z. Flag if votes >= min_votes."""
+    import numpy as np
+    from collections import Counter
+
+    out = []
+    for sid, recs in slots.items():
+        n = len(recs)
+        if n < cfg["min_samples"]:
+            continue
+        responses = [r["response"] for r in recs]
+        # --- freq (on normalized exact value) ---
+        normed = [_norm(x) for x in responses]
+        fc = Counter(normed)
+        maj_exists = (fc.most_common(1)[0][1] / n) >= 0.5
+        # --- minority cluster (embeddings) ---
+        # local maps each DISTINCT response -> cluster id; weight by occurrence for true sizes
+        local = cluster(responses, vecs, cfg["answer_threshold"])
+        csize = Counter(local[x] for x in responses)
+        cluster_dom = (max(csize.values()) / n) >= 0.5
+        # --- centroid z-score ---
+        M = np.array([vecs[x] for x in responses], dtype=float)
+        M /= (np.linalg.norm(M, axis=1, keepdims=True) + 1e-12)
+        cen = M.mean(axis=0)
+        cen /= (np.linalg.norm(cen) + 1e-12)
+        sims = M @ cen
+        sd = float(sims.std())
+        z = (sims - sims.mean()) / sd if sd > 1e-9 else np.zeros(n)
+        for i, r in enumerate(recs):
+            # strict '<': a share exactly == minority_frac (e.g. 2/10 at 0.2) is NOT a minority.
+            # Raise minority_frac if you want such borderline splits flagged.
+            f = maj_exists and (fc[normed[i]] / n < cfg["minority_frac"])
+            cl = cluster_dom and (csize[local[responses[i]]] / n < cfg["minority_frac"])
+            ce = bool(z[i] < -cfg["z_k"])
+            votes = int(f) + int(cl) + int(ce)
+            if votes >= cfg["min_votes"]:
+                fired = "|".join(m for m, v in (("freq", f), ("cluster", cl), ("centroid", ce)) if v)
+                out.append({
+                    "slot_id": sid, "question_id": r["question_id"], "file_name": r["file_name"],
+                    "response": r["response"], "votes": votes, "methods_fired": fired,
+                    "freq_share": round(fc[normed[i]] / n, 3),
+                    "cluster_share": round(csize[local[responses[i]]] / n, 3),
+                    "centroid_z": round(float(z[i]), 3),
+                })
+    return out
+
+
+def flag_questionnaires(outliers, all_files, n) -> list[dict]:
+    from collections import defaultdict
+    byf = defaultdict(list)
+    for o in outliers:
+        byf[o["file_name"]].append(o["question_id"])
+    rows = []
+    for fn in all_files:
+        qs = sorted(set(byf.get(fn, [])))
+        rows.append({"file_name": fn, "n_outliers": len(byf.get(fn, [])),
+                     "flagged": len(byf.get(fn, [])) >= n, "questions": ",".join(qs)})
+    return sorted(rows, key=lambda r: -r["n_outliers"])
 
 
 def embed_texts(texts: list[str], embeddings, workers: int, cache_path: Path) -> dict[str, list[float]]:
@@ -118,40 +216,49 @@ def cos(a, b) -> float:
     return float(a @ b / ((np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12))
 
 
-def build_rows(units: list[dict], vecs: dict, cluster_threshold: float, drift_threshold: float) -> list[dict]:
+def assign_clusters(units: list[dict], vecs: dict, ct: float):
+    """One clustering pass. Returns (assign, canon):
+    assign: (level, text) -> global cluster id; canon: cid -> canonical (most-frequent) text."""
     from collections import Counter
-
-    rows = []
+    assign, canon = {}, {}
     next_cid = 0
     for level in sorted({u["level"] for u in units}):
         lvl_units = [u for u in units if u["level"] == level]
-        texts = [u["text"] for u in lvl_units]
-        local = cluster(texts, vecs, cluster_threshold)
-        # group units by local cluster id
-        groups: dict[int, list[dict]] = {}
+        local = cluster([u["text"] for u in lvl_units], vecs, ct)
+        groups = {}
         for u in lvl_units:
             groups.setdefault(local[u["text"]], []).append(u)
         for _, gunits in sorted(groups.items()):
             cid = next_cid
             next_cid += 1
             counts = Counter(u["text"] for u in gunits)
-            # canonical: most frequent, tie -> longest, then alphabetical
-            canonical = sorted(counts, key=lambda t: (-counts[t], -len(t), t))[0]
-            dom_qid = Counter(u["question_id"] for u in gunits).most_common(1)[0][0]
+            canon[cid] = sorted(counts, key=lambda t: (-counts[t], -len(t), t))[0]
             for u in gunits:
-                sim_c = 1.0 if u["text"] == canonical else cos(vecs[u["text"]], vecs[canonical])
-                is_canon = u["text"] == canonical
-                rows.append({
-                    "cluster_id": cid,
-                    "level": level,
-                    "question_id": dom_qid,
-                    "file_name": u["file_name"],
-                    "variant_text": u["text"],
-                    "is_canonical": is_canon,
-                    "is_drift": (not is_canon) and sim_c < drift_threshold,
-                    "occurrences": counts[u["text"]],
-                    "cosine_to_canonical": round(sim_c, 4),
-                })
+                assign[(level, u["text"])] = cid
+    return assign, canon
+
+
+def build_rows(units: list[dict], vecs: dict, assign: dict, canon: dict, drift_threshold: float) -> list[dict]:
+    from collections import Counter
+    by_cid = {}
+    for u in units:
+        by_cid.setdefault(assign[(u["level"], u["text"])], []).append(u)
+    rows = []
+    for cid, gunits in sorted(by_cid.items()):
+        canonical = canon[cid]
+        counts = Counter(u["text"] for u in gunits)
+        dom_qid = Counter(u["question_id"] for u in gunits).most_common(1)[0][0]
+        level = gunits[0]["level"]
+        for u in gunits:
+            is_canon = u["text"] == canonical
+            sim_c = 1.0 if is_canon else cos(vecs[u["text"]], vecs[canonical])
+            rows.append({
+                "cluster_id": cid, "level": level, "question_id": dom_qid,
+                "file_name": u["file_name"], "variant_text": u["text"],
+                "is_canonical": is_canon,
+                "is_drift": (not is_canon) and sim_c < drift_threshold,
+                "occurrences": counts[u["text"]], "cosine_to_canonical": round(sim_c, 4),
+            })
     return rows
 
 
@@ -241,6 +348,56 @@ def make_matrix(df, path, ct, dt):
                    full_html=True, default_width=f"{width}px", default_height=f"{height}px")
 
 
+def make_outlier_matrix(df_out, df_flags, slots, canon, path, ocfg):
+    """Heatmap: files (rows) x answer-slots (cols). green=answered, red=outlier, blank=missing."""
+    import plotly.graph_objects as go
+    from collections import Counter
+
+    slot_ids = sorted(slots)
+    dom_qid = {sid: Counter(r["question_id"] for r in slots[sid]).most_common(1)[0][0]
+               for sid in slot_ids}
+    files = sorted(df_flags["file_name"])
+    flagged = set(df_flags[df_flags["flagged"]]["file_name"])
+    outset = {(r.file_name, r.slot_id) for r in df_out.itertuples()}
+    resp = {(r["file_name"], sid): r["response"]
+            for sid in slot_ids for r in slots[sid]}
+
+    xlabels = [f"{dom_qid[sid]} <span style='color:#999'>(s{sid})</span>" for sid in slot_ids]
+    z, hover = [], []
+    for f in files:
+        zr, hr = [], []
+        for sid in slot_ids:
+            if (f, sid) not in resp:
+                zr.append(None); hr.append("")
+            elif (f, sid) in outset:
+                zr.append(2); hr.append(f"<b>{f}</b> · {dom_qid[sid]}<br>OUTLIER: {resp[(f, sid)]}")
+            else:
+                zr.append(0); hr.append(f"{f} · {dom_qid[sid]}<br>{resp[(f, sid)]}")
+        z.append(zr); hover.append(hr)
+
+    ylabels = [("⚑ " + f) if f in flagged else f for f in files]
+    colorscale = [[0.0, "#2e7d32"], [0.5, "#2e7d32"], [0.5, "#c62828"], [1.0, "#c62828"]]
+    fig = go.Figure(go.Heatmap(
+        z=z, x=xlabels, y=ylabels, customdata=hover,
+        hovertemplate="%{customdata}<extra></extra>",
+        zmin=0, zmax=2, colorscale=colorscale, showscale=False, xgap=1, ygap=1))
+    cell_w, cell_h = 60, 22
+    width = 260 + cell_w * len(slot_ids)
+    height = 200 + cell_h * len(files)
+    n_flag = len(flagged)
+    fig.update_layout(
+        title={"text": (f"<b>Answer outliers</b> — {n_flag} flagged questionnaire(s) "
+                        f"(≥{ocfg['multi_outlier_n']} outliers)<br>"
+                        f"<sub>red = outlier answer · ⚑ = flagged file · hover for value</sub>"),
+               "x": 0, "xanchor": "left", "y": 0.985, "yanchor": "top", "font": {"size": 16}},
+        xaxis={"side": "top", "tickangle": -45, "tickfont": {"size": 11}, "showgrid": False, "ticks": ""},
+        yaxis={"autorange": "reversed", "tickfont": {"size": 11}, "showgrid": False, "ticks": ""},
+        width=width, height=height, margin={"l": 200, "r": 80, "t": 170, "b": 20},
+        plot_bgcolor="white", font={"family": "system-ui,sans-serif"})
+    fig.write_html(str(path), include_plotlyjs="cdn",
+                   full_html=True, default_width=f"{width}px", default_height=f"{height}px")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--in", dest="in_dir", default="output/llm_parsed_full2", help="dir of parsed *.json")
@@ -249,6 +406,9 @@ def main() -> None:
     ap.add_argument("--cache", default="output/.vec_cache.json", help="vector cache (text->embedding)")
     ap.add_argument("--cluster-threshold", type=float, help="override config drift.cluster_threshold")
     ap.add_argument("--drift-threshold", type=float, help="override config drift.drift_threshold")
+    ap.add_argument("--min-votes", type=int, help="override outliers.min_votes")
+    ap.add_argument("--multi-outlier-n", type=int, help="override outliers.multi_outlier_n")
+    ap.add_argument("--answer-threshold", type=float, help="override outliers.answer_threshold")
     args = ap.parse_args()
 
     cfg = load_config()
@@ -262,26 +422,55 @@ def main() -> None:
     print(f"{len(units)} units from {len(set(u['file_name'] for u in units))} files; "
           f"{len(set(u['text'] for u in units))} distinct strings")
 
-    embeddings = make_embeddings(cfg)
-    vecs = embed_texts([u["text"] for u in units], embeddings, args.workers, Path(args.cache))
+    ocfg = dict(cfg["outliers"])
+    if args.min_votes is not None: ocfg["min_votes"] = args.min_votes
+    if args.multi_outlier_n is not None: ocfg["multi_outlier_n"] = args.multi_outlier_n
+    if args.answer_threshold is not None: ocfg["answer_threshold"] = args.answer_threshold
 
-    rows = build_rows(units, vecs, ct, dt)
+    answer_recs = extract_answers(in_dir)
+
+    embeddings = make_embeddings(cfg)
+    all_texts = [u["text"] for u in units] + [r["response"] for r in answer_recs]
+    vecs = embed_texts(all_texts, embeddings, args.workers, Path(args.cache))
+
+    assign, canon = assign_clusters(units, vecs, ct)
+    rows = build_rows(units, vecs, assign, canon, dt)
+
+    slots = group_by_slot(answer_recs, assign)
+    outliers = detect_outliers(slots, vecs, ocfg)
+    all_files = sorted({r["file_name"] for r in answer_recs})
+    flags = flag_questionnaires(outliers, all_files, ocfg["multi_outlier_n"])
 
     import pandas as pd
     df = pd.DataFrame(rows).sort_values(
         ["cluster_id", "is_canonical", "file_name"], ascending=[True, False, True])
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    df.to_excel(out, sheet_name="drift", index=False)
+
+    OUT_COLS = ["slot_id", "question_id", "file_name", "response", "votes",
+                "methods_fired", "freq_share", "cluster_share", "centroid_z"]
+    df_out = pd.DataFrame(outliers, columns=OUT_COLS).sort_values(
+        ["file_name", "question_id"]) if outliers else pd.DataFrame(columns=OUT_COLS)
+    df_flags = pd.DataFrame(flags, columns=["file_name", "n_outliers", "flagged", "questions"])
+
+    with pd.ExcelWriter(out) as xl:
+        df.to_excel(xl, sheet_name="drift", index=False)
+        df_out.to_excel(xl, sheet_name="answer_outliers", index=False)
+        df_flags.to_excel(xl, sheet_name="questionnaire_flags", index=False)
 
     html_out = out.with_suffix(".html")
+    outlier_html = out.with_name("drift_analysis_outliers.html")
     make_matrix(df, html_out, ct, dt)
+    make_outlier_matrix(df_out, df_flags, slots, canon, outlier_html, ocfg)
 
     n_clusters = df["cluster_id"].nunique()
     n_drift = int(df["is_drift"].sum())
     print(f"clusters: {n_clusters}  |  drift rows: {n_drift}  "
           f"(cluster_threshold={ct}, drift_threshold={dt})")
-    print(f"wrote {out}\nwrote {html_out}")
+    print(f"outliers: {len(outliers)} answers  |  flagged questionnaires: "
+          f"{int(df_flags['flagged'].sum())}/{len(df_flags)} (min_votes={ocfg['min_votes']}, "
+          f"multi_outlier_n={ocfg['multi_outlier_n']})")
+    print(f"wrote {out}\nwrote {html_out}\nwrote {outlier_html}")
 
 
 if __name__ == "__main__":
