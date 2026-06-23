@@ -144,6 +144,19 @@ def detect_outliers(slots, vecs, cfg) -> list[dict]:
     return out
 
 
+def flag_questionnaires(outliers, all_files, n) -> list[dict]:
+    from collections import defaultdict
+    byf = defaultdict(list)
+    for o in outliers:
+        byf[o["file_name"]].append(o["question_id"])
+    rows = []
+    for fn in all_files:
+        qs = sorted(set(byf.get(fn, [])))
+        rows.append({"file_name": fn, "n_outliers": len(byf.get(fn, [])),
+                     "flagged": len(byf.get(fn, [])) >= n, "questions": ",".join(qs)})
+    return sorted(rows, key=lambda r: -r["n_outliers"])
+
+
 def embed_texts(texts: list[str], embeddings, workers: int, cache_path: Path) -> dict[str, list[float]]:
     """Embed each distinct text once, multithreaded. Cached to cache_path (text->vector JSON)
     so repeat runs are reproducible and only new strings hit the API."""
