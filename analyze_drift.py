@@ -99,6 +99,51 @@ def group_by_slot(answer_recs, assign) -> dict:
     return slots
 
 
+def detect_outliers(slots, vecs, cfg) -> list[dict]:
+    """Per slot, vote across freq / minority-cluster / centroid-z. Flag if votes >= min_votes."""
+    import numpy as np
+    from collections import Counter
+
+    out = []
+    for sid, recs in slots.items():
+        n = len(recs)
+        if n < cfg["min_samples"]:
+            continue
+        responses = [r["response"] for r in recs]
+        # --- freq (on normalized exact value) ---
+        normed = [_norm(x) for x in responses]
+        fc = Counter(normed)
+        maj_exists = (fc.most_common(1)[0][1] / n) >= 0.5
+        # --- minority cluster (embeddings) ---
+        # local maps each DISTINCT response -> cluster id; weight by occurrence for true sizes
+        local = cluster(responses, vecs, cfg["answer_threshold"])
+        csize = Counter(local[x] for x in responses)
+        cluster_dom = (max(csize.values()) / n) >= 0.5
+        # --- centroid z-score ---
+        M = np.array([vecs[x] for x in responses], dtype=float)
+        M /= (np.linalg.norm(M, axis=1, keepdims=True) + 1e-12)
+        cen = M.mean(axis=0)
+        cen /= (np.linalg.norm(cen) + 1e-12)
+        sims = M @ cen
+        sd = float(sims.std())
+        z = (sims - sims.mean()) / sd if sd > 1e-9 else np.zeros(n)
+        for i, r in enumerate(recs):
+            f = maj_exists and (fc[normed[i]] / n < cfg["minority_frac"])
+            cl = cluster_dom and (csize[local[responses[i]]] / n < cfg["minority_frac"])
+            ce = bool(z[i] < -cfg["z_k"])
+            votes = int(f) + int(cl) + int(ce)
+            if votes >= cfg["min_votes"]:
+                fired = "|".join(m for m, v in (("freq", f), ("cluster", cl), ("centroid", ce)) if v)
+                out.append({
+                    "slot_id": sid, "question_id": r["question_id"], "file_name": r["file_name"],
+                    "response": r["response"], "votes": votes, "methods_fired": fired,
+                    "freq_share": round(fc[normed[i]] / n, 3),
+                    "cluster_share": round(csize[local[responses[i]]] / n, 3),
+                    "centroid_z": round(float(z[i]), 3),
+                })
+    return out
+
+
 def embed_texts(texts: list[str], embeddings, workers: int, cache_path: Path) -> dict[str, list[float]]:
     """Embed each distinct text once, multithreaded. Cached to cache_path (text->vector JSON)
     so repeat runs are reproducible and only new strings hit the API."""
