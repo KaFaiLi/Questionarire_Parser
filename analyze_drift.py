@@ -45,7 +45,7 @@ def make_embeddings(cfg: dict):
 def extract_units(in_dir: Path) -> list[dict]:
     """One unit per non-empty template string (question / prompt / option_label)."""
     units = []
-    for p in sorted(in_dir.glob("*.json")):
+    for p in sorted(Path(in_dir).glob("*.json")):
         data = json.loads(p.read_text(encoding="utf-8"))
         fname = data.get("file_name", p.stem)
         for q in data.get("questions", []):
@@ -128,6 +128,8 @@ def detect_outliers(slots, vecs, cfg) -> list[dict]:
         sd = float(sims.std())
         z = (sims - sims.mean()) / sd if sd > 1e-9 else np.zeros(n)
         for i, r in enumerate(recs):
+            # strict '<': a share exactly == minority_frac (e.g. 2/10 at 0.2) is NOT a minority.
+            # Raise minority_frac if you want such borderline splits flagged.
             f = maj_exists and (fc[normed[i]] / n < cfg["minority_frac"])
             cl = cluster_dom and (csize[local[responses[i]]] / n < cfg["minority_frac"])
             ce = bool(z[i] < -cfg["z_k"])
