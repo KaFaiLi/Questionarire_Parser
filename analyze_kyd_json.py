@@ -66,6 +66,11 @@ Multiple folders (each analysed independently — one report per folder)::
 
     python analyze_kyd_json.py 2024Q4/ 2025Q1/ 2025Q2/ --out-dir output/
 
+Pool every folder into ONE combined report (single shared baseline; each row
+tagged with its source folder as '<source>/<file>')::
+
+    python analyze_kyd_json.py 2024Q4/ 2025Q1/ 2025Q2/ --combine -o output/combined.xlsx
+
 Requires: pandas, openpyxl, rapidfuzz
 """
 
@@ -259,6 +264,48 @@ def load_long(paths: list[Path], extra_blank: frozenset[str]) -> pd.DataFrame:
     # "questionnaire" is the identity key used throughout the analysis.
     long["questionnaire"] = long["file_name"]
     return long
+
+
+def _source_label(in_path: Path) -> str:
+    """A short, human label for one input (folder name, or a file's stem)."""
+    return in_path.name if in_path.is_dir() else in_path.stem
+
+
+def unique_sources(inputs: list[Path]) -> list[tuple[Path, str]]:
+    """Pair each input with a UNIQUE source label. Folder basenames can collide
+    (e.g. two 'ground_truth' dirs); disambiguate with the parent, then a suffix,
+    so pooled questionnaire ids never clash across folders."""
+    used: set[str] = set()
+    out: list[tuple[Path, str]] = []
+    for p in inputs:
+        base = _source_label(p)
+        lbl = base
+        if lbl in used:
+            lbl = f"{p.parent.name}_{base}" if p.parent.name else base
+            i = 2
+            while lbl in used:
+                lbl = f"{base}_{i}"
+                i += 1
+        used.add(lbl)
+        out.append((p, lbl))
+    return out
+
+
+def load_long_many(labeled: list[tuple[Path, str]],
+                   extra_blank: frozenset[str]) -> pd.DataFrame:
+    """Pool every questionnaire from several inputs into ONE long frame for a
+    single combined analysis. Adds a `source` column and namespaces the
+    questionnaire identity as '<source>/<file_name>' so files that share a name
+    across folders stay distinct and each row remains traceable to its folder."""
+    frames = []
+    for in_path, label in labeled:
+        lf = load_long(_discover(in_path), extra_blank)
+        lf.insert(0, "source", label)
+        lf["questionnaire"] = label + "/" + lf["file_name"].astype(str)
+        frames.append(lf)
+    if not frames:
+        raise ValueError("No question rows found in the input(s).")
+    return pd.concat(frames, ignore_index=True)
 
 
 # ── Fuzzy question clustering ──────────────────────────────────────────────────
@@ -683,20 +730,27 @@ def _plan_outputs(inputs: list[Path], output: str | None, out_dir: str | None,
     return plan
 
 
+def _extra_blank(args) -> frozenset[str]:
+    return frozenset(
+        s.strip().casefold() for s in args.treat_as_blank.split(",") if s.strip())
+
+
 def analyze_one(in_path: Path, args, out_path: Path) -> None:
     """Run the full review on one input (file or folder) and write its report.
 
     Each input is analysed independently — the consensus baseline is computed
     per folder, so separate cohorts are never pooled."""
-    extra_blank = frozenset(
-        s.strip().casefold() for s in args.treat_as_blank.split(",") if s.strip())
     paths = _discover(in_path)
     print(f"\n=== {in_path} ===")
     print(f"Loading {len(paths)} questionnaire(s):")
     for p in paths:
         print(f"  - {p.name}")
+    _process_long(load_long(paths, _extra_blank(args)), args, out_path)
 
-    long    = load_long(paths, extra_blank)
+
+def _process_long(long: pd.DataFrame, args, out_path: Path) -> None:
+    """Cluster -> canonical -> build tables -> write report + console digest,
+    for a long frame that may come from one input or several pooled together."""
     matcher = _build_conditional(args.conditional_regex)
     long["conditional"] = long["question_text"].map(lambda t: _is_conditional(t, matcher))
 
@@ -785,6 +839,9 @@ def main() -> None:
                     help="Report xlsx path. Single input only; for many inputs use --out-dir.")
     ap.add_argument("--out-dir", default=None,
                     help="Write every report into this directory as <input>_kyd_analysis.xlsx.")
+    ap.add_argument("--combine", action="store_true",
+                    help="Pool ALL inputs into one population and write a single combined "
+                         "report; each row is tagged with its source folder.")
     ap.add_argument("--threshold", type=int, default=85,
                     help="Fuzzy cutoff 0-100 for grouping equivalent questions (default 85).")
     ap.add_argument("--answer-threshold", type=int, default=80,
@@ -811,10 +868,21 @@ def main() -> None:
         for p in missing:
             print(f"Input not found: {p}", file=sys.stderr)
         sys.exit(1)
-    if args.output and len(inputs) > 1:
-        ap.error("-o/--output takes a single input; use --out-dir for multiple inputs.")
+    if args.output and len(inputs) > 1 and not args.combine:
+        ap.error("-o/--output takes a single input; use --out-dir, or --combine for one pooled report.")
     if args.out_dir:
         Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+
+    if args.combine:
+        labeled = unique_sources(inputs)
+        print(f"\n=== combined: pooling {len(inputs)} input(s) "
+              f"[{', '.join(l for _, l in labeled)}] ===")
+        out_path = (Path(args.output) if args.output
+                    else (Path(args.out_dir) if args.out_dir else Path("."))
+                    / "combined_kyd_analysis.xlsx")
+        _process_long(load_long_many(labeled, _extra_blank(args)), args, out_path)
+        print(f"\n[DONE] 1 combined report written.\n  - {out_path.resolve()}")
+        return
 
     written: list[Path] = []
     for in_path, out_path in _plan_outputs(inputs, args.output, args.out_dir,
