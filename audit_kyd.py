@@ -352,6 +352,175 @@ def run_audit(paths, *, threshold=85, answer_threshold=80, core_frac=0.6,
     }
 
 
+# ── Visual HTML dashboard ───────────────────────────────────────────────────────
+SEV_COLOR = {"high": "#c62828", "medium": "#ef6c00", "low": "#2e7d32", "info": "#607d8b"}
+_CHECK_LABEL = {
+    "QDRIFT-SUB": "Question drift (substantive)",
+    "QDRIFT-FMT": "Question drift (formatting)",
+    "QMISSING": "Missing question",
+    "QEXTRA": "Extra / specific question",
+    "ADRIFT-OUT": "Answer outlier",
+    "REDFLAG": "Red flag",
+}
+
+
+def write_html_report(sheets: dict[str, pd.DataFrame], path: Path, *,
+                      title: str = "KYD Audit — Findings") -> None:
+    """Self-contained HTML dashboard: KPI cards, a firm × check severity heatmap,
+    a per-firm severity bar, and a colour-coded findings table."""
+    import html as _html
+    import plotly.graph_objects as go
+
+    f = sheets["findings"]
+    n_q = int(sheets["summary"].loc[sheets["summary"]["key"] == "questionnaires",
+                                    "n_findings"].iloc[0]) if not sheets["summary"].empty else 0
+
+    def card(label, value, color="#1f2937"):
+        return (f'<div class="card"><div class="card-val" style="color:{color}">{value}</div>'
+                f'<div class="card-lbl">{label}</div></div>')
+
+    sev_counts = {s: int((f["severity"] == s).sum()) for s in SEV_RANK}
+    n_firms_flagged = f["questionnaire"].nunique() if not f.empty else 0
+    cards = "".join([
+        card("Total findings", len(f)),
+        card("High", sev_counts["high"], SEV_COLOR["high"]),
+        card("Medium", sev_counts["medium"], SEV_COLOR["medium"]),
+        card("Low", sev_counts["low"], SEV_COLOR["low"]),
+        card("Questionnaires flagged", f"{n_firms_flagged}/{n_q}"),
+        card("Red flags", int((f["check_id"] == "REDFLAG").sum()) if not f.empty else 0,
+             SEV_COLOR["high"]),
+    ])
+
+    charts_html = ""
+    if not f.empty:
+        firms = sorted(f["questionnaire"].unique())
+        checks = [c for c in _CHECK_LABEL if c in set(f["check_id"])]
+        # heatmap: worst severity per (firm, check); z = severity rank inverted (3=high)
+        z, hover = [], []
+        for firm in firms:
+            zr, hr = [], []
+            for c in checks:
+                sub = f[(f["questionnaire"] == firm) & (f["check_id"] == c)]
+                if sub.empty:
+                    zr.append(None); hr.append("")
+                else:
+                    worst = min(SEV_RANK[s] for s in sub["severity"])
+                    zr.append(3 - worst)
+                    hr.append(f"<b>{firm}</b><br>{_CHECK_LABEL[c]}<br>"
+                              f"{len(sub)} finding(s), worst: "
+                              f"{['high','medium','low','info'][worst]}")
+            z.append(zr); hover.append(hr)
+        heat = go.Figure(go.Heatmap(
+            z=z, x=[_CHECK_LABEL[c] for c in checks], y=firms,
+            customdata=hover, hovertemplate="%{customdata}<extra></extra>",
+            zmin=0, zmax=3, xgap=2, ygap=2,
+            colorscale=[[0.0, "#607d8b"], [0.33, "#607d8b"], [0.34, "#2e7d32"],
+                        [0.66, "#2e7d32"], [0.67, "#ef6c00"], [0.83, "#ef6c00"],
+                        [0.84, "#c62828"], [1.0, "#c62828"]],
+            colorbar={"tickvals": [0.4, 1.3, 2.1, 2.8],
+                      "ticktext": ["info", "low", "medium", "high"],
+                      "title": {"text": "severity"}, "thickness": 14, "len": 0.6}))
+        heat.update_layout(
+            title="Findings by questionnaire × check (worst severity)",
+            xaxis={"side": "top", "tickangle": -30}, yaxis={"autorange": "reversed"},
+            height=120 + 30 * len(firms), margin={"l": 160, "r": 40, "t": 120, "b": 20},
+            plot_bgcolor="white", font={"family": "system-ui,sans-serif", "size": 12})
+
+        # stacked bar: count per firm by severity
+        bar = go.Figure()
+        for s in ["high", "medium", "low", "info"]:
+            counts = [int(((f["questionnaire"] == firm) & (f["severity"] == s)).sum())
+                      for firm in firms]
+            if sum(counts):
+                bar.add_bar(name=s, y=firms, x=counts, orientation="h",
+                            marker_color=SEV_COLOR[s])
+        bar.update_layout(
+            title="Findings per questionnaire by severity", barmode="stack",
+            yaxis={"autorange": "reversed"}, xaxis={"title": "findings"},
+            height=120 + 30 * len(firms), margin={"l": 160, "r": 40, "t": 60, "b": 40},
+            plot_bgcolor="white", legend={"orientation": "h", "y": 1.08},
+            font={"family": "system-ui,sans-serif", "size": 12})
+
+        # embed plotly.js inline (once) so the report is fully self-contained / offline.
+        charts_html = (
+            f'<div class="chart">{heat.to_html(full_html=False, include_plotlyjs=True)}</div>'
+            f'<div class="chart">{bar.to_html(full_html=False, include_plotlyjs=False)}</div>')
+
+    # findings table
+    if f.empty:
+        table_html = '<p class="empty">No findings — every questionnaire matches consensus.</p>'
+    else:
+        trs = []
+        for r in f.itertuples():
+            sev = r.severity
+            badge = (f'<span class="badge" style="background:{SEV_COLOR.get(sev, "#777")}">'
+                     f'{sev.upper()}</span>')
+            trs.append(
+                "<tr>"
+                f'<td class="mono">{_html.escape(r.finding_id)}</td>'
+                f"<td>{badge}</td>"
+                f'<td class="mono">{_html.escape(r.check_id)}</td>'
+                f"<td>{_html.escape(r.questionnaire)}</td>"
+                f'<td class="mono">{_html.escape(str(r.canonical_id))}</td>'
+                f'<td class="wrap">{_html.escape(str(r.canonical_question))}</td>'
+                f'<td class="wrap">{_html.escape(str(r.observation))}</td>'
+                f'<td class="wrap small">{_html.escape(str(r.evidence))}</td>'
+                "</tr>")
+        table_html = (
+            '<table><thead><tr>'
+            '<th>ID</th><th>Severity</th><th>Check</th><th>Questionnaire</th>'
+            '<th>Q</th><th>Canonical question</th><th>Observation</th><th>Evidence</th>'
+            "</tr></thead><tbody>" + "".join(trs) + "</tbody></table>")
+
+    doc = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{_html.escape(title)}</title>
+<style>
+  :root {{ --bg:#f4f5f7; --fg:#1f2937; --line:#e5e7eb; }}
+  * {{ box-sizing:border-box; }}
+  body {{ margin:0; background:var(--bg); color:var(--fg);
+         font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }}
+  header {{ background:linear-gradient(120deg,#0f2740,#1d4e6f); color:#fff;
+            padding:28px 32px; }}
+  header h1 {{ margin:0; font-size:22px; }}
+  header p {{ margin:6px 0 0; opacity:.8; font-size:13px; }}
+  .wrap-main {{ max-width:1200px; margin:0 auto; padding:24px 32px 64px; }}
+  .cards {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+            gap:14px; margin:-44px 0 28px; }}
+  .card {{ background:#fff; border:1px solid var(--line); border-radius:12px;
+           padding:18px 16px; box-shadow:0 1px 3px rgba(0,0,0,.06); }}
+  .card-val {{ font-size:30px; font-weight:700; line-height:1; }}
+  .card-lbl {{ margin-top:8px; font-size:12px; color:#6b7280; text-transform:uppercase;
+               letter-spacing:.04em; }}
+  .chart {{ background:#fff; border:1px solid var(--line); border-radius:12px;
+            padding:8px 12px; margin-bottom:22px; overflow-x:auto; }}
+  table {{ width:100%; border-collapse:collapse; background:#fff; border:1px solid var(--line);
+           border-radius:12px; overflow:hidden; font-size:13px; }}
+  thead th {{ background:#0f2740; color:#fff; text-align:left; padding:10px 12px;
+              font-weight:600; position:sticky; top:0; }}
+  tbody td {{ padding:9px 12px; border-top:1px solid var(--line); vertical-align:top; }}
+  tbody tr:nth-child(even) {{ background:#fafbfc; }}
+  .badge {{ color:#fff; padding:2px 9px; border-radius:999px; font-size:11px; font-weight:700; }}
+  .mono {{ font-family:ui-monospace,SFMono-Regular,Menlo,monospace; white-space:nowrap; }}
+  .wrap {{ max-width:280px; }} .small {{ color:#6b7280; font-size:12px; }}
+  .empty {{ background:#fff; border:1px solid var(--line); border-radius:12px; padding:40px;
+            text-align:center; color:#6b7280; }}
+  h2 {{ font-size:15px; margin:26px 0 12px; color:#374151; }}
+</style></head><body>
+<header>
+  <h1>{_html.escape(title)}</h1>
+  <p>Drift measured against population consensus · {len(f)} finding(s) across {n_q} questionnaire(s)</p>
+</header>
+<div class="wrap-main">
+  <div class="cards">{cards}</div>
+  {charts_html}
+  <h2>Findings register</h2>
+  {table_html}
+</div></body></html>"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(doc, encoding="utf-8")
+
+
 def _digest(sheets: dict[str, pd.DataFrame]) -> None:
     findings = sheets["findings"]
     print(f"\n=== Audit findings: {len(findings)} ===")
@@ -389,6 +558,8 @@ def main() -> None:
                     help="Extra regex marking a question as optional/conditional (repeatable).")
     ap.add_argument("--use-embeddings", action="store_true",
                     help="Use analyze_drift semantic clustering (needs config.yaml); offline fallback otherwise.")
+    ap.add_argument("--no-html", action="store_true",
+                    help="Skip the visual HTML dashboard (xlsx only).")
     args = ap.parse_args()
 
     in_path = Path(args.input)
@@ -411,8 +582,15 @@ def main() -> None:
                 else (in_path.parent if in_path.is_file() else in_path) / "audit_findings.xlsx")
     akj.write_report(out_path, sheets)
 
+    html_path = None
+    if not args.no_html:
+        html_path = out_path.with_suffix(".html")
+        write_html_report(sheets, html_path)
+
     _digest(sheets)
     print(f"\n[OK] Wrote {out_path.resolve()}")
+    if html_path:
+        print(f"[OK] Wrote {html_path.resolve()}")
 
 
 if __name__ == "__main__":
