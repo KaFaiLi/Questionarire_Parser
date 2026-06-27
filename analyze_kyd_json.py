@@ -74,6 +74,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import sys
 from collections import Counter
@@ -82,6 +83,53 @@ from pathlib import Path
 
 import pandas as pd
 from rapidfuzz import fuzz
+
+
+# ── Long-path handling ─────────────────────────────────────────────────────────
+# On Windows a path over ~260 chars raises "file not found" unless it is absolute,
+# backslash-separated and prefixed with the extended-length marker \\?\ (UNC paths
+# use \\?\UNC\). These helpers apply that transparently and are no-ops elsewhere,
+# so every read/write below is safe for deeply-nested inputs and outputs.
+def longpath(p) -> str:
+    """Return a filesystem string for *p* that is safe past the OS max-path limit."""
+    s = os.fspath(p)
+    if os.name != "nt" or s.startswith("\\\\?\\"):
+        return s
+    ap = os.path.abspath(s)
+    if ap.startswith("\\\\"):              # UNC: \\server\share -> \\?\UNC\server\share
+        return "\\\\?\\UNC\\" + ap[2:]
+    return "\\\\?\\" + ap
+
+
+def path_exists(p) -> bool:
+    return os.path.exists(longpath(p))
+
+
+def read_text(p, encoding: str = "utf-8") -> str:
+    with open(longpath(p), "r", encoding=encoding) as fh:
+        return fh.read()
+
+
+def write_text(p, data: str, encoding: str = "utf-8") -> None:
+    ensure_parent(p)
+    with open(longpath(p), "w", encoding=encoding) as fh:
+        fh.write(data)
+
+
+def ensure_parent(p) -> None:
+    parent = Path(p).parent
+    if str(parent):
+        os.makedirs(longpath(parent), exist_ok=True)
+
+
+def iter_json(path: Path) -> list[Path]:
+    """List *.json under a directory, tolerant of long directory paths."""
+    out = []
+    with os.scandir(longpath(path)) as it:
+        for e in it:
+            if e.is_file() and e.name.lower().endswith(".json") and not e.name.startswith("~$"):
+                out.append(path / e.name)
+    return sorted(out)
 
 # ── Status values ─────────────────────────────────────────────────────────────
 STATUS_ANSWERED = "answered"
@@ -165,11 +213,11 @@ def _answer_text(selection: str, answer: str) -> str:
 
 
 def _discover(path: Path) -> list[Path]:
-    if path.is_file():
+    if path.is_file() or (not path.is_dir() and path_exists(path) and path.suffix):
         return [path]
-    files = sorted(p for p in path.glob("*.json") if not p.name.startswith("~$"))
+    files = iter_json(path)
     if not files:
-        raise FileNotFoundError(f"No *.json questionnaires found in {path.resolve()}")
+        raise FileNotFoundError(f"No *.json questionnaires found in {path}")
     return files
 
 
@@ -180,7 +228,7 @@ def load_long(paths: list[Path], extra_blank: frozenset[str]) -> pd.DataFrame:
     """
     rows = []
     for p in paths:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(read_text(p))
         fname = str(data.get("file_name") or p.stem).strip() or p.stem
         order = 0
         for q in data.get("questions", []):
@@ -586,8 +634,8 @@ def _autosize(ws, df: pd.DataFrame, max_w: int = 60) -> None:
 
 
 def write_report(path: Path, sheets: dict[str, pd.DataFrame]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+    ensure_parent(path)
+    with pd.ExcelWriter(longpath(path), engine="openpyxl") as writer:
         for name, df in sheets.items():
             safe = name[:31]
             (df if not df.empty else pd.DataFrame({"(none)": []})).to_excel(
@@ -758,7 +806,7 @@ def main() -> None:
     args = ap.parse_args()
 
     inputs = [Path(p) for p in args.inputs]
-    missing = [p for p in inputs if not p.exists()]
+    missing = [p for p in inputs if not path_exists(p)]
     if missing:
         for p in missing:
             print(f"Input not found: {p}", file=sys.stderr)
