@@ -31,7 +31,7 @@ FIELDS_TEXT = {"prompt": "prompt", "option_label": "option"}  # sub-question fie
 
 
 def load_config(path: str = "config.yaml") -> dict:
-    return yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    return yaml.safe_load(akj.read_text(path))
 
 
 def _norm(s: str) -> str:
@@ -52,8 +52,8 @@ def make_embeddings(cfg: dict):
 def extract_units(in_dir: Path) -> list[dict]:
     """One unit per non-empty template string (question / prompt / option_label)."""
     units = []
-    for p in sorted(Path(in_dir).glob("*.json")):
-        data = json.loads(p.read_text(encoding="utf-8"))
+    for p in akj.iter_json(Path(in_dir)):
+        data = json.loads(akj.read_text(p))
         fname = data.get("file_name", p.stem)
         for q in data.get("questions", []):
             qid = q.get("question_id", "")
@@ -72,8 +72,8 @@ def extract_answers(in_dir) -> list[dict]:
     """One record per answered sub-question. anchor = option_label, else prompt, else question
     text (raw, matching extract_units so the cluster lookup hits). response = answer or selection."""
     recs = []
-    for p in sorted(Path(in_dir).glob("*.json")):
-        d = json.loads(p.read_text(encoding="utf-8"))
+    for p in akj.iter_json(Path(in_dir)):
+        d = json.loads(akj.read_text(p))
         fn = d.get("file_name", p.stem)
         for q in d.get("questions", []):
             qid = q.get("question_id", "")
@@ -173,8 +173,8 @@ def embed_texts(texts: list[str], embeddings, workers: int, cache_path: Path) ->
     from tqdm import tqdm
 
     vecs: dict[str, list[float]] = {}
-    if cache_path.exists():
-        vecs = json.loads(cache_path.read_text(encoding="utf-8"))
+    if akj.path_exists(cache_path):
+        vecs = json.loads(akj.read_text(cache_path))
     uniq = sorted(set(texts))
     todo = [t for t in uniq if t not in vecs]
     if todo:
@@ -184,8 +184,7 @@ def embed_texts(texts: list[str], embeddings, workers: int, cache_path: Path) ->
             for b, res in tqdm(zip(batches, ex.map(embeddings.embed_documents, batches)),
                                total=len(batches), desc="embedding"):
                 vecs.update(zip(b, res))
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(json.dumps(vecs), encoding="utf-8")
+        akj.write_text(cache_path, json.dumps(vecs))
     print(f"embeddings: {len(todo)} new, {len(uniq) - len(todo)} cached  ({cache_path})")
     return {t: vecs[t] for t in uniq}
 
@@ -351,7 +350,7 @@ def make_matrix(df, path, ct, dt):
         width=width, height=height,
         margin={"l": 200, "r": 80, "t": 170, "b": 20},
         plot_bgcolor="white", font={"family": "system-ui,sans-serif"})
-    fig.write_html(str(path), include_plotlyjs="cdn",
+    fig.write_html(akj.longpath(path), include_plotlyjs="cdn",
                    full_html=True, default_width=f"{width}px", default_height=f"{height}px")
 
 
@@ -401,7 +400,7 @@ def make_outlier_matrix(df_out, df_flags, slots, canon, path, ocfg):
         yaxis={"autorange": "reversed", "tickfont": {"size": 11}, "showgrid": False, "ticks": ""},
         width=width, height=height, margin={"l": 200, "r": 80, "t": 170, "b": 20},
         plot_bgcolor="white", font={"family": "system-ui,sans-serif"})
-    fig.write_html(str(path), include_plotlyjs="cdn",
+    fig.write_html(akj.longpath(path), include_plotlyjs="cdn",
                    full_html=True, default_width=f"{width}px", default_height=f"{height}px")
 
 
@@ -435,7 +434,7 @@ def analyze_drift_one(in_dir: Path, out: Path, *, cfg, ct, dt, ocfg,
 
     df = pd.DataFrame(rows).sort_values(
         ["cluster_id", "is_canonical", "file_name"], ascending=[True, False, True])
-    out.parent.mkdir(parents=True, exist_ok=True)
+    akj.ensure_parent(out)
 
     OUT_COLS = ["slot_id", "question_id", "file_name", "response", "votes",
                 "methods_fired", "freq_share", "cluster_share", "centroid_z"]
@@ -443,7 +442,7 @@ def analyze_drift_one(in_dir: Path, out: Path, *, cfg, ct, dt, ocfg,
         ["file_name", "question_id"]) if outliers else pd.DataFrame(columns=OUT_COLS)
     df_flags = pd.DataFrame(flags, columns=["file_name", "n_outliers", "flagged", "questions"])
 
-    with pd.ExcelWriter(out) as xl:
+    with pd.ExcelWriter(akj.longpath(out)) as xl:
         df.to_excel(xl, sheet_name="drift", index=False)
         df_out.to_excel(xl, sheet_name="answer_outliers", index=False)
         df_flags.to_excel(xl, sheet_name="questionnaire_flags", index=False)
@@ -492,7 +491,7 @@ def main() -> None:
     if args.answer_threshold is not None: ocfg["answer_threshold"] = args.answer_threshold
 
     inputs = [Path(p) for p in args.in_dirs]
-    missing = [p for p in inputs if not p.exists()]
+    missing = [p for p in inputs if not akj.path_exists(p)]
     if missing:
         for p in missing:
             print(f"Input not found: {p}", file=sys.stderr)

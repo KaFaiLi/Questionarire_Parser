@@ -107,8 +107,8 @@ def load_rules(path: str | None) -> list[dict]:
     candidates = [path] if path else []
     candidates.append(str(Path(__file__).with_name("audit_rules.yaml")))
     for cand in candidates:
-        if cand and Path(cand).exists():
-            raw = yaml.safe_load(Path(cand).read_text(encoding="utf-8"))
+        if cand and akj.path_exists(cand):
+            raw = yaml.safe_load(akj.read_text(cand))
             break
     if not raw:
         raw = _DEFAULT_RULES
@@ -521,8 +521,7 @@ def write_html_report(sheets: dict[str, pd.DataFrame], path: Path, *,
   <h2>Findings register</h2>
   {table_html}
 </div></body></html>"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(doc, encoding="utf-8")
+    akj.write_text(path, doc)
 
 
 def _digest(sheets: dict[str, pd.DataFrame]) -> None:
@@ -600,7 +599,7 @@ def main() -> None:
     args = ap.parse_args()
 
     inputs = [Path(p) for p in args.inputs]
-    missing = [p for p in inputs if not p.exists()]
+    missing = [p for p in inputs if not akj.path_exists(p)]
     if missing:
         for p in missing:
             print(f"Input not found: {p}", file=sys.stderr)
