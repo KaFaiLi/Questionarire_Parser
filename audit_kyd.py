@@ -41,6 +41,10 @@ Usage
     python audit_kyd.py path/to/firms/ --rules my_rules.yaml
     python audit_kyd.py path/to/firms/ --use-embeddings   # optional, needs config.yaml
 
+Multiple folders (each audited independently — one report per folder)::
+
+    python audit_kyd.py 2024Q4/ 2025Q1/ 2025Q2/ --out-dir output/
+
 Requires: pandas, openpyxl, rapidfuzz, pyyaml  (all already project deps).
 """
 
@@ -536,12 +540,45 @@ def _digest(sheets: dict[str, pd.DataFrame]) -> None:
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────────
+def audit_one(in_path: Path, args, out_path: Path) -> None:
+    """Audit one input (file or folder) and write its xlsx + HTML dashboard.
+
+    Each input is audited independently — the consensus baseline is computed
+    per folder, so separate cohorts are never pooled."""
+    paths = akj._discover(in_path)
+    print(f"\n=== {in_path} ===")
+    print(f"Loading {len(paths)} questionnaire(s):")
+    for p in paths:
+        print(f"  - {p.name}")
+
+    sheets = run_audit(
+        paths, threshold=args.threshold, answer_threshold=args.answer_threshold,
+        core_frac=args.core_frac, extra_max=args.extra_max,
+        treat_as_blank=args.treat_as_blank, conditional_regex=args.conditional_regex,
+        rules_path=args.rules, use_embeddings=args.use_embeddings)
+
+    akj.write_report(out_path, sheets)
+    html_path = None
+    if not args.no_html:
+        html_path = out_path.with_suffix(".html")
+        write_html_report(sheets, html_path, title=f"KYD Audit — {in_path.name or in_path.stem}")
+
+    _digest(sheets)
+    print(f"[OK] Wrote {out_path.resolve()}")
+    if html_path:
+        print(f"[OK] Wrote {html_path.resolve()}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("input", help="A KYD .json file OR a directory of them.")
+    ap.add_argument("inputs", nargs="+",
+                    help="One or more KYD .json files OR directories of them. "
+                         "Each is audited independently (one report per input).")
     ap.add_argument("-o", "--output", default=None,
-                    help="Report xlsx path (default: <input>/audit_findings.xlsx).")
+                    help="Report xlsx path. Single input only; for many inputs use --out-dir.")
+    ap.add_argument("--out-dir", default=None,
+                    help="Write every report into this directory as <input>_audit_findings.xlsx.")
     ap.add_argument("--threshold", type=int, default=85,
                     help="Fuzzy cutoff 0-100 for grouping equivalent questions (default 85).")
     ap.add_argument("--answer-threshold", type=int, default=80,
@@ -562,35 +599,31 @@ def main() -> None:
                     help="Skip the visual HTML dashboard (xlsx only).")
     args = ap.parse_args()
 
-    in_path = Path(args.input)
-    if not in_path.exists():
-        print(f"Input not found: {in_path}", file=sys.stderr)
+    inputs = [Path(p) for p in args.inputs]
+    missing = [p for p in inputs if not p.exists()]
+    if missing:
+        for p in missing:
+            print(f"Input not found: {p}", file=sys.stderr)
         sys.exit(1)
+    if args.output and len(inputs) > 1:
+        ap.error("-o/--output takes a single input; use --out-dir for multiple inputs.")
+    if args.out_dir:
+        Path(args.out_dir).mkdir(parents=True, exist_ok=True)
 
-    paths = akj._discover(in_path)
-    print(f"Loading {len(paths)} questionnaire(s):")
-    for p in paths:
-        print(f"  - {p.name}")
+    written: list[Path] = []
+    for in_path, out_path in akj._plan_outputs(inputs, args.output, args.out_dir,
+                                               "audit_findings.xlsx"):
+        try:
+            audit_one(in_path, args, out_path)
+            written.append(out_path)
+        except (FileNotFoundError, ValueError) as e:
+            print(f"  SKIP {in_path}: {e}", file=sys.stderr)
 
-    sheets = run_audit(
-        paths, threshold=args.threshold, answer_threshold=args.answer_threshold,
-        core_frac=args.core_frac, extra_max=args.extra_max,
-        treat_as_blank=args.treat_as_blank, conditional_regex=args.conditional_regex,
-        rules_path=args.rules, use_embeddings=args.use_embeddings)
-
-    out_path = (Path(args.output) if args.output
-                else (in_path.parent if in_path.is_file() else in_path) / "audit_findings.xlsx")
-    akj.write_report(out_path, sheets)
-
-    html_path = None
-    if not args.no_html:
-        html_path = out_path.with_suffix(".html")
-        write_html_report(sheets, html_path)
-
-    _digest(sheets)
-    print(f"\n[OK] Wrote {out_path.resolve()}")
-    if html_path:
-        print(f"[OK] Wrote {html_path.resolve()}")
+    print(f"\n[DONE] {len(written)}/{len(inputs)} audit(s) written.")
+    for w in written:
+        print(f"  - {w.resolve()}")
+    if not written:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

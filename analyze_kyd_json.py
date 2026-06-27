@@ -62,6 +62,10 @@ Usage
     python analyze_kyd_json.py Demo/kyd_examples/ --threshold 88
     python analyze_kyd_json.py Demo/kyd_examples/ --treat-as-blank "n/a,nil,-"
 
+Multiple folders (each analysed independently — one report per folder)::
+
+    python analyze_kyd_json.py 2024Q4/ 2025Q1/ 2025Q2/ --out-dir output/
+
 Requires: pandas, openpyxl, rapidfuzz
 """
 
@@ -594,41 +598,52 @@ def write_report(path: Path, sheets: dict[str, pd.DataFrame]) -> None:
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
-def main() -> None:
-    ap = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("input",
-                    help="A KYD .json file OR a directory of them.")
-    ap.add_argument("-o", "--output", default=None,
-                    help="Report xlsx path (default: <input>/kyd_analysis.xlsx).")
-    ap.add_argument("--threshold", type=int, default=85,
-                    help="Fuzzy cutoff 0-100 for grouping equivalent questions (default 85).")
-    ap.add_argument("--answer-threshold", type=int, default=80,
-                    help="Fuzzy cutoff 0-100 for grouping equivalent answers (default 80).")
-    ap.add_argument("--treat-as-blank", default="",
-                    help="Comma-separated placeholders to treat as blank (e.g. 'n/a,nil,-').")
-    ap.add_argument("--conditional-regex", action="append", default=[],
-                    help="Extra regex marking a question as optional/conditional (repeatable).")
-    ap.add_argument("--optional-blank-frac", type=float, default=0.6,
-                    help="Flag optional if blank in >= this fraction of files (default 0.6).")
-    ap.add_argument("--optional-min-present", type=int, default=2,
-                    help="Min files before blank-pattern rule applies (default 2).")
-    ap.add_argument("--outlier-min-answers", type=int, default=4,
-                    help="Min answered questionnaires before outlier check runs (default 4).")
-    ap.add_argument("--outlier-frac", type=float, default=0.25,
-                    help="An answer group is a minority if its share <= this (default 0.25).")
-    ap.add_argument("--outlier-majority-frac", type=float, default=0.6,
-                    help="Require a majority group >= this share to flag (default 0.6).")
-    args = ap.parse_args()
+def _resolve_out(in_path: Path, output: str | None, out_dir: str | None,
+                 default_name: str) -> Path:
+    """Where one input's report is written.
+    --out-dir wins (named <input>_<default>); else -o (single input); else the
+    report lands inside the input folder (or its parent for a single file)."""
+    if out_dir:
+        stem = in_path.name if in_path.is_dir() else in_path.stem
+        return Path(out_dir) / f"{stem}_{default_name}"
+    if output:
+        return Path(output)
+    base = in_path.parent if in_path.is_file() else in_path
+    return base / default_name
 
-    in_path = Path(args.input)
-    if not in_path.exists():
-        print(f"Input not found: {in_path}", file=sys.stderr)
-        sys.exit(1)
 
+def _plan_outputs(inputs: list[Path], output: str | None, out_dir: str | None,
+                  default_name: str) -> list[tuple[Path, Path]]:
+    """One distinct output path per input. Folder basenames can collide (e.g. two
+    inputs both named 'ground_truth'); disambiguate with the parent name, then a
+    numeric suffix, so no report silently overwrites another."""
+    plan: list[tuple[Path, Path]] = []
+    used: set[str] = set()
+    for in_path in inputs:
+        out = _resolve_out(in_path, output, out_dir, default_name)
+        if str(out) in used:
+            stem = in_path.name if in_path.is_dir() else in_path.stem
+            parent = in_path.parent.name
+            cand = out.with_name(f"{parent}_{stem}_{default_name}") if parent else out
+            i = 2
+            while str(cand) in used:
+                cand = out.with_name(f"{stem}_{i}_{default_name}")
+                i += 1
+            out = cand
+        used.add(str(out))
+        plan.append((in_path, out))
+    return plan
+
+
+def analyze_one(in_path: Path, args, out_path: Path) -> None:
+    """Run the full review on one input (file or folder) and write its report.
+
+    Each input is analysed independently — the consensus baseline is computed
+    per folder, so separate cohorts are never pooled."""
     extra_blank = frozenset(
         s.strip().casefold() for s in args.treat_as_blank.split(",") if s.strip())
     paths = _discover(in_path)
+    print(f"\n=== {in_path} ===")
     print(f"Loading {len(paths)} questionnaire(s):")
     for p in paths:
         print(f"  - {p.name}")
@@ -660,8 +675,6 @@ def main() -> None:
     overview    = build_overview(fact, dimq, changes, outliers, n_q,
                                  args.threshold, args.answer_threshold)
 
-    out_path = (Path(args.output) if args.output
-                else (in_path.parent if in_path.is_file() else in_path) / "kyd_analysis.xlsx")
     write_report(out_path, {
         "overview":            overview,
         "comparison":          comparison,
@@ -673,7 +686,7 @@ def main() -> None:
     })
 
     # ── Console digest ─────────────────────────────────────────────────────
-    print("\n=== Goal 1: empty answers ===")
+    print("\n--- Goal 1: empty answers ---")
     miss = fact[fact["is_present"] & ~fact["is_answered"] & ~fact["is_optional"]]
     opt  = fact[fact["is_present"] & ~fact["is_answered"] &  fact["is_optional"]]
     print(f"  {len(miss)} required answer(s) MISSING   "
@@ -682,7 +695,7 @@ def main() -> None:
         print(f"    [MISSING] {r['questionnaire']}  {r['canonical_id']}: "
               f"{r['canonical_question'][:55]}")
 
-    print("\n=== Goal 2: questionnaire-specific / coverage gaps ===")
+    print("\n--- Goal 2: questionnaire-specific / coverage gaps ---")
     spec = dimq[dimq["specific_to"] != ""]
     gaps = dimq[(dimq["n_missing_from"] > 0) & (dimq["specific_to"] == "")]
     if spec.empty and gaps.empty:
@@ -694,7 +707,7 @@ def main() -> None:
         print(f"    [GAP]      {r['canonical_id']} in {r['n_present']}/{n_q}: "
               f"{r['canonical_question'][:55]}")
 
-    print("\n=== Goal 3: question wording changes ===")
+    print("\n--- Goal 3: question wording changes ---")
     if changes.empty:
         print("  none.")
     for cid in changes["canonical_id"].unique():
@@ -703,7 +716,7 @@ def main() -> None:
         for _, r in sub.iterrows():
             print(f"      ({r['used_by_count']}×) {r['variant_text'][:65]}")
 
-    print("\n=== Goal 4: answer outliers ===")
+    print("\n--- Goal 4: answer outliers ---")
     if outliers.empty:
         print("  none.")
     for _, r in outliers.iterrows():
@@ -711,7 +724,64 @@ def main() -> None:
               f"'{r['outlier_answer'][:35]}' vs majority '{r['majority_answer'][:35]}' "
               f"({r['agree_with_majority']} agree)")
 
-    print(f"\n[OK] Wrote {out_path.resolve()}")
+    print(f"[OK] Wrote {out_path.resolve()}")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("inputs", nargs="+",
+                    help="One or more KYD .json files OR directories of them. "
+                         "Each is analysed independently (one report per input).")
+    ap.add_argument("-o", "--output", default=None,
+                    help="Report xlsx path. Single input only; for many inputs use --out-dir.")
+    ap.add_argument("--out-dir", default=None,
+                    help="Write every report into this directory as <input>_kyd_analysis.xlsx.")
+    ap.add_argument("--threshold", type=int, default=85,
+                    help="Fuzzy cutoff 0-100 for grouping equivalent questions (default 85).")
+    ap.add_argument("--answer-threshold", type=int, default=80,
+                    help="Fuzzy cutoff 0-100 for grouping equivalent answers (default 80).")
+    ap.add_argument("--treat-as-blank", default="",
+                    help="Comma-separated placeholders to treat as blank (e.g. 'n/a,nil,-').")
+    ap.add_argument("--conditional-regex", action="append", default=[],
+                    help="Extra regex marking a question as optional/conditional (repeatable).")
+    ap.add_argument("--optional-blank-frac", type=float, default=0.6,
+                    help="Flag optional if blank in >= this fraction of files (default 0.6).")
+    ap.add_argument("--optional-min-present", type=int, default=2,
+                    help="Min files before blank-pattern rule applies (default 2).")
+    ap.add_argument("--outlier-min-answers", type=int, default=4,
+                    help="Min answered questionnaires before outlier check runs (default 4).")
+    ap.add_argument("--outlier-frac", type=float, default=0.25,
+                    help="An answer group is a minority if its share <= this (default 0.25).")
+    ap.add_argument("--outlier-majority-frac", type=float, default=0.6,
+                    help="Require a majority group >= this share to flag (default 0.6).")
+    args = ap.parse_args()
+
+    inputs = [Path(p) for p in args.inputs]
+    missing = [p for p in inputs if not p.exists()]
+    if missing:
+        for p in missing:
+            print(f"Input not found: {p}", file=sys.stderr)
+        sys.exit(1)
+    if args.output and len(inputs) > 1:
+        ap.error("-o/--output takes a single input; use --out-dir for multiple inputs.")
+    if args.out_dir:
+        Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+
+    written: list[Path] = []
+    for in_path, out_path in _plan_outputs(inputs, args.output, args.out_dir,
+                                           "kyd_analysis.xlsx"):
+        try:
+            analyze_one(in_path, args, out_path)
+            written.append(out_path)
+        except (FileNotFoundError, ValueError) as e:
+            print(f"  SKIP {in_path}: {e}", file=sys.stderr)
+
+    print(f"\n[DONE] {len(written)}/{len(inputs)} report(s) written.")
+    for w in written:
+        print(f"  - {w.resolve()}")
+    if not written:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

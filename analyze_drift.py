@@ -7,6 +7,10 @@ wording per cluster (most frequent), and flags drift. Output: one Excel tab, one
 
     uv run python analyze_drift.py --in output/llm_parsed_full2 -o output/drift_analysis.xlsx
 
+Multiple folders (each analysed independently — one report per folder)::
+
+    uv run python analyze_drift.py --in 2024Q4/ 2025Q1/ 2025Q2/ --out-dir output/
+
 Config (endpoint / key / embedding deployment / thresholds) comes from config.yaml.
 Tune --cluster-threshold (merges wordings into one logical question) and --drift-threshold
 (flags a variant as real drift) by reviewing the Excel.
@@ -16,9 +20,12 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
 
 import yaml
+
+import analyze_kyd_json as akj  # reuse _plan_outputs for consistent multi-input output naming
 
 FIELDS_TEXT = {"prompt": "prompt", "option_label": "option"}  # sub-question field -> level
 
@@ -398,40 +405,25 @@ def make_outlier_matrix(df_out, df_flags, slots, canon, path, ocfg):
                    full_html=True, default_width=f"{width}px", default_height=f"{height}px")
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--in", dest="in_dir", default="output/llm_parsed_full2", help="dir of parsed *.json")
-    ap.add_argument("-o", "--out", default="output/drift_analysis.xlsx", help="output Excel file")
-    ap.add_argument("--workers", type=int, default=8, help="concurrent embedding requests")
-    ap.add_argument("--cache", default="output/.vec_cache.json", help="vector cache (text->embedding)")
-    ap.add_argument("--cluster-threshold", type=float, help="override config drift.cluster_threshold")
-    ap.add_argument("--drift-threshold", type=float, help="override config drift.drift_threshold")
-    ap.add_argument("--min-votes", type=int, help="override outliers.min_votes")
-    ap.add_argument("--multi-outlier-n", type=int, help="override outliers.multi_outlier_n")
-    ap.add_argument("--answer-threshold", type=float, help="override outliers.answer_threshold")
-    args = ap.parse_args()
+def analyze_drift_one(in_dir: Path, out: Path, *, cfg, ct, dt, ocfg,
+                      embeddings, cache_path: Path, workers: int) -> bool:
+    """Run the embedding drift + outlier pipeline on one folder and write its
+    xlsx + two HTML matrices. Each folder is analysed independently — clustering
+    and the consensus canonical wording are computed per folder, so separate
+    cohorts are never pooled. Returns True if a report was written."""
+    import pandas as pd
 
-    cfg = load_config()
-    ct = args.cluster_threshold if args.cluster_threshold is not None else cfg["drift"]["cluster_threshold"]
-    dt = args.drift_threshold if args.drift_threshold is not None else cfg["drift"]["drift_threshold"]
-
-    in_dir = Path(args.in_dir)
     units = extract_units(in_dir)
     if not units:
-        ap.error(f"no template strings found in {in_dir}")
+        print(f"  SKIP {in_dir}: no template strings found", file=sys.stderr)
+        return False
+    print(f"\n=== {in_dir} ===")
     print(f"{len(units)} units from {len(set(u['file_name'] for u in units))} files; "
           f"{len(set(u['text'] for u in units))} distinct strings")
 
-    ocfg = dict(cfg["outliers"])
-    if args.min_votes is not None: ocfg["min_votes"] = args.min_votes
-    if args.multi_outlier_n is not None: ocfg["multi_outlier_n"] = args.multi_outlier_n
-    if args.answer_threshold is not None: ocfg["answer_threshold"] = args.answer_threshold
-
     answer_recs = extract_answers(in_dir)
-
-    embeddings = make_embeddings(cfg)
     all_texts = [u["text"] for u in units] + [r["response"] for r in answer_recs]
-    vecs = embed_texts(all_texts, embeddings, args.workers, Path(args.cache))
+    vecs = embed_texts(all_texts, embeddings, workers, cache_path)
 
     assign, canon = assign_clusters(units, vecs, ct)
     rows = build_rows(units, vecs, assign, canon, dt)
@@ -441,10 +433,8 @@ def main() -> None:
     all_files = sorted({r["file_name"] for r in answer_recs})
     flags = flag_questionnaires(outliers, all_files, ocfg["multi_outlier_n"])
 
-    import pandas as pd
     df = pd.DataFrame(rows).sort_values(
         ["cluster_id", "is_canonical", "file_name"], ascending=[True, False, True])
-    out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
 
     OUT_COLS = ["slot_id", "question_id", "file_name", "response", "votes",
@@ -459,7 +449,9 @@ def main() -> None:
         df_flags.to_excel(xl, sheet_name="questionnaire_flags", index=False)
 
     html_out = out.with_suffix(".html")
-    outlier_html = out.with_name("drift_analysis_outliers.html")
+    # derive the outlier-matrix name from this report's stem so multiple folders
+    # never collide on a hardcoded filename.
+    outlier_html = out.with_name(f"{out.stem}_outliers.html")
     make_matrix(df, html_out, ct, dt)
     make_outlier_matrix(df_out, df_flags, slots, canon, outlier_html, ocfg)
 
@@ -471,6 +463,59 @@ def main() -> None:
           f"{int(df_flags['flagged'].sum())}/{len(df_flags)} (min_votes={ocfg['min_votes']}, "
           f"multi_outlier_n={ocfg['multi_outlier_n']})")
     print(f"wrote {out}\nwrote {html_out}\nwrote {outlier_html}")
+    return True
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--in", dest="in_dirs", nargs="+", default=["output/llm_parsed_full2"],
+                    help="one or more dirs of parsed *.json (each analysed independently)")
+    ap.add_argument("-o", "--out", default=None,
+                    help="output Excel file. Single input only; for many inputs use --out-dir.")
+    ap.add_argument("--out-dir", default=None,
+                    help="write every report into this dir as <input>_drift_analysis.xlsx.")
+    ap.add_argument("--workers", type=int, default=8, help="concurrent embedding requests")
+    ap.add_argument("--cache", default="output/.vec_cache.json", help="vector cache (text->embedding)")
+    ap.add_argument("--cluster-threshold", type=float, help="override config drift.cluster_threshold")
+    ap.add_argument("--drift-threshold", type=float, help="override config drift.drift_threshold")
+    ap.add_argument("--min-votes", type=int, help="override outliers.min_votes")
+    ap.add_argument("--multi-outlier-n", type=int, help="override outliers.multi_outlier_n")
+    ap.add_argument("--answer-threshold", type=float, help="override outliers.answer_threshold")
+    args = ap.parse_args()
+
+    cfg = load_config()
+    ct = args.cluster_threshold if args.cluster_threshold is not None else cfg["drift"]["cluster_threshold"]
+    dt = args.drift_threshold if args.drift_threshold is not None else cfg["drift"]["drift_threshold"]
+    ocfg = dict(cfg["outliers"])
+    if args.min_votes is not None: ocfg["min_votes"] = args.min_votes
+    if args.multi_outlier_n is not None: ocfg["multi_outlier_n"] = args.multi_outlier_n
+    if args.answer_threshold is not None: ocfg["answer_threshold"] = args.answer_threshold
+
+    inputs = [Path(p) for p in args.in_dirs]
+    missing = [p for p in inputs if not p.exists()]
+    if missing:
+        for p in missing:
+            print(f"Input not found: {p}", file=sys.stderr)
+        sys.exit(1)
+    if args.out and len(inputs) > 1:
+        ap.error("-o/--out takes a single input; use --out-dir for multiple inputs.")
+    if args.out_dir:
+        Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+
+    embeddings = make_embeddings(cfg)
+    cache_path = Path(args.cache)
+
+    written: list[Path] = []
+    for in_dir, out in akj._plan_outputs(inputs, args.out, args.out_dir, "drift_analysis.xlsx"):
+        if analyze_drift_one(in_dir, out, cfg=cfg, ct=ct, dt=dt, ocfg=ocfg,
+                             embeddings=embeddings, cache_path=cache_path, workers=args.workers):
+            written.append(out)
+
+    print(f"\n[DONE] {len(written)}/{len(inputs)} report(s) written.")
+    for w in written:
+        print(f"  - {w.resolve()}")
+    if not written:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
