@@ -11,6 +11,11 @@ Multiple folders (each analysed independently — one report per folder)::
 
     uv run python analyze_drift.py --in 2024Q4/ 2025Q1/ 2025Q2/ --out-dir output/
 
+Pool every folder into ONE combined report (single shared baseline; file ids
+prefixed with their source folder as '<source>/<file>')::
+
+    uv run python analyze_drift.py --in 2024Q4/ 2025Q1/ 2025Q2/ --combine -o output/combined.xlsx
+
 Config (endpoint / key / embedding deployment / thresholds) comes from config.yaml.
 Tune --cluster-threshold (merges wordings into one logical question) and --drift-threshold
 (flags a variant as real drift) by reviewing the Excel.
@@ -465,23 +470,61 @@ def make_outlier_matrix(df_out, df_flags, slots, canon, path, ocfg):
                    full_html=True, default_width=f"{width}px", default_height=f"{height}px")
 
 
+def extract_units_many(labeled: list[tuple[Path, str]]) -> list[dict]:
+    """Pool units across folders; namespace file_name as '<source>/<file>'."""
+    units = []
+    for in_dir, label in labeled:
+        for u in extract_units(Path(in_dir)):
+            u["file_name"] = f"{label}/{u['file_name']}"
+            units.append(u)
+    return units
+
+
+def extract_answers_many(labeled: list[tuple[Path, str]]) -> list[dict]:
+    recs = []
+    for in_dir, label in labeled:
+        for r in extract_answers(Path(in_dir)):
+            r["file_name"] = f"{label}/{r['file_name']}"
+            recs.append(r)
+    return recs
+
+
 def analyze_drift_one(in_dir: Path, out: Path, *, cfg, ct, dt, ocfg, nm_floor, merges,
                       embeddings, cache_path: Path, workers: int) -> bool:
-    """Run the embedding drift + outlier pipeline on one folder and write its
-    xlsx + two HTML matrices. Each folder is analysed independently — clustering
-    and the consensus canonical wording are computed per folder, so separate
-    cohorts are never pooled. Returns True if a report was written."""
+    """Per-folder run: extract this folder only, then build the report."""
+    units = extract_units(in_dir)
+    answer_recs = extract_answers(in_dir)
+    return _drift_report(units, answer_recs, out, label=str(in_dir), ct=ct, dt=dt,
+                         ocfg=ocfg, nm_floor=nm_floor, merges=merges,
+                         embeddings=embeddings, cache_path=cache_path, workers=workers)
+
+
+def analyze_drift_combined(labeled: list[tuple[Path, str]], out: Path, *, cfg, ct, dt,
+                           ocfg, nm_floor, merges, embeddings, cache_path: Path, workers: int) -> bool:
+    """Pool every folder into ONE population (source-tagged file ids) and build a
+    single combined report."""
+    units = extract_units_many(labeled)
+    answer_recs = extract_answers_many(labeled)
+    return _drift_report(units, answer_recs, out,
+                         label=f"combined ({len(labeled)} folders)", ct=ct, dt=dt,
+                         ocfg=ocfg, nm_floor=nm_floor, merges=merges,
+                         embeddings=embeddings, cache_path=cache_path, workers=workers)
+
+
+def _drift_report(units: list[dict], answer_recs: list[dict], out: Path, *, label,
+                  ct, dt, ocfg, nm_floor, merges, embeddings, cache_path: Path, workers: int) -> bool:
+    """Embed -> cluster -> drift rows + outliers -> xlsx + two HTML matrices,
+    for units/answers from one folder or several pooled together. The
+    consensus canonical wording is computed over whatever is passed in."""
     import pandas as pd
 
-    units = extract_units(in_dir)
     if not units:
-        print(f"  SKIP {in_dir}: no template strings found", file=sys.stderr)
+        print(f"  SKIP {label}: no template strings found", file=sys.stderr)
         return False
-    print(f"\n=== {in_dir} ===")
+    print(f"\n=== {label} ===")
     print(f"{len(units)} units from {len(set(u['file_name'] for u in units))} files; "
           f"{len(set(u['text'] for u in units))} distinct strings")
 
-    answer_recs = extract_answers(in_dir)
     all_texts = [u["text"] for u in units] + [r["response"] for r in answer_recs]
     vecs = embed_texts(all_texts, embeddings, workers, cache_path)
 
@@ -544,6 +587,9 @@ def main() -> None:
                     help="output Excel file. Single input only; for many inputs use --out-dir.")
     ap.add_argument("--out-dir", default=None,
                     help="write every report into this dir as <input>_drift_analysis.xlsx.")
+    ap.add_argument("--combine", action="store_true",
+                    help="pool ALL inputs into one population and write a single combined "
+                         "report (file ids prefixed with their source folder).")
     ap.add_argument("--workers", type=int, default=8, help="concurrent embedding requests")
     ap.add_argument("--cache", default="output/.vec_cache.json", help="vector cache (text->embedding)")
     ap.add_argument("--cluster-threshold", type=float, help="override config drift.cluster_threshold")
@@ -573,13 +619,29 @@ def main() -> None:
         for p in missing:
             print(f"Input not found: {p}", file=sys.stderr)
         sys.exit(1)
-    if args.out and len(inputs) > 1:
-        ap.error("-o/--out takes a single input; use --out-dir for multiple inputs.")
+    if args.out and len(inputs) > 1 and not args.combine:
+        ap.error("-o/--out takes a single input; use --out-dir, or --combine for one pooled report.")
     if args.out_dir:
         Path(args.out_dir).mkdir(parents=True, exist_ok=True)
 
     embeddings = make_embeddings(cfg)
     cache_path = Path(args.cache)
+
+    if args.combine:
+        labeled = akj.unique_sources(inputs)
+        print(f"\n=== combined: pooling {len(inputs)} input(s) "
+              f"[{', '.join(l for _, l in labeled)}] ===")
+        out = (Path(args.out) if args.out
+               else (Path(args.out_dir) if args.out_dir else Path("."))
+               / "combined_drift_analysis.xlsx")
+        ok = analyze_drift_combined(labeled, out, cfg=cfg, ct=ct, dt=dt, ocfg=ocfg,
+                                    nm_floor=nm_floor, merges=merges,
+                                    embeddings=embeddings, cache_path=cache_path,
+                                    workers=args.workers)
+        print(f"\n[DONE] {int(ok)} combined report written.")
+        if ok:
+            print(f"  - {out.resolve()}")
+        sys.exit(0 if ok else 1)
 
     written: list[Path] = []
     for in_dir, out in akj._plan_outputs(inputs, args.out, args.out_dir, "drift_analysis.xlsx"):

@@ -45,6 +45,11 @@ Multiple folders (each audited independently — one report per folder)::
 
     python audit_kyd.py 2024Q4/ 2025Q1/ 2025Q2/ --out-dir output/
 
+Pool every folder into ONE combined audit (single shared baseline; each finding
+tagged with its source folder as '<source>/<file>')::
+
+    python audit_kyd.py 2024Q4/ 2025Q1/ 2025Q2/ --combine -o output/combined.xlsx
+
 Requires: pandas, openpyxl, rapidfuzz, pyyaml  (all already project deps).
 """
 
@@ -298,15 +303,26 @@ def _embedding_clusters(long: pd.DataFrame, cluster_threshold: float | None) -> 
 
 
 # ── Pipeline ───────────────────────────────────────────────────────────────────
-def run_audit(paths, *, threshold=85, answer_threshold=80, core_frac=0.6,
-              extra_max=1, treat_as_blank="", conditional_regex=None,
-              rules_path=None, use_embeddings=False,
-              embed_cluster_threshold=None) -> dict[str, pd.DataFrame]:
-    """End-to-end: load -> cluster/canonical -> reuse base tables -> findings.
-    Returns the sheet dict ready for ``akj.write_report``."""
+def run_audit(paths, *, treat_as_blank="", **kw) -> dict[str, pd.DataFrame]:
+    """End-to-end on one set of paths: load -> findings sheet dict."""
     extra_blank = frozenset(s.strip().casefold()
                             for s in treat_as_blank.split(",") if s.strip())
-    long = akj.load_long(paths, extra_blank)
+    return audit_from_long(akj.load_long(paths, extra_blank), **kw)
+
+
+def run_audit_combined(labeled, *, treat_as_blank="", **kw) -> dict[str, pd.DataFrame]:
+    """End-to-end pooling several inputs into ONE population (source-tagged)."""
+    extra_blank = frozenset(s.strip().casefold()
+                            for s in treat_as_blank.split(",") if s.strip())
+    return audit_from_long(akj.load_long_many(labeled, extra_blank), **kw)
+
+
+def audit_from_long(long, *, threshold=85, answer_threshold=80, core_frac=0.6,
+                    extra_max=1, conditional_regex=None,
+                    rules_path=None, use_embeddings=False,
+                    embed_cluster_threshold=None) -> dict[str, pd.DataFrame]:
+    """Cluster/canonical -> reuse base tables -> findings register, for a long
+    frame from one input or several pooled together."""
     matcher = akj._build_conditional(conditional_regex or [])
     long["conditional"] = long["question_text"].map(lambda t: akj._is_conditional(t, matcher))
 
@@ -539,6 +555,26 @@ def _digest(sheets: dict[str, pd.DataFrame]) -> None:
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────────
+def _audit_kw(args) -> dict:
+    return dict(threshold=args.threshold, answer_threshold=args.answer_threshold,
+                core_frac=args.core_frac, extra_max=args.extra_max,
+                conditional_regex=args.conditional_regex, rules_path=args.rules,
+                use_embeddings=args.use_embeddings)
+
+
+def _emit(sheets: dict, out_path: Path, args, title: str) -> None:
+    """Write the xlsx + (optional) HTML dashboard and print the digest."""
+    akj.write_report(out_path, sheets)
+    html_path = None
+    if not args.no_html:
+        html_path = out_path.with_suffix(".html")
+        write_html_report(sheets, html_path, title=title)
+    _digest(sheets)
+    print(f"[OK] Wrote {out_path.resolve()}")
+    if html_path:
+        print(f"[OK] Wrote {html_path.resolve()}")
+
+
 def audit_one(in_path: Path, args, out_path: Path) -> None:
     """Audit one input (file or folder) and write its xlsx + HTML dashboard.
 
@@ -549,23 +585,8 @@ def audit_one(in_path: Path, args, out_path: Path) -> None:
     print(f"Loading {len(paths)} questionnaire(s):")
     for p in paths:
         print(f"  - {p.name}")
-
-    sheets = run_audit(
-        paths, threshold=args.threshold, answer_threshold=args.answer_threshold,
-        core_frac=args.core_frac, extra_max=args.extra_max,
-        treat_as_blank=args.treat_as_blank, conditional_regex=args.conditional_regex,
-        rules_path=args.rules, use_embeddings=args.use_embeddings)
-
-    akj.write_report(out_path, sheets)
-    html_path = None
-    if not args.no_html:
-        html_path = out_path.with_suffix(".html")
-        write_html_report(sheets, html_path, title=f"KYD Audit — {in_path.name or in_path.stem}")
-
-    _digest(sheets)
-    print(f"[OK] Wrote {out_path.resolve()}")
-    if html_path:
-        print(f"[OK] Wrote {html_path.resolve()}")
+    sheets = run_audit(paths, treat_as_blank=args.treat_as_blank, **_audit_kw(args))
+    _emit(sheets, out_path, args, title=f"KYD Audit — {in_path.name or in_path.stem}")
 
 
 def main() -> None:
@@ -578,6 +599,9 @@ def main() -> None:
                     help="Report xlsx path. Single input only; for many inputs use --out-dir.")
     ap.add_argument("--out-dir", default=None,
                     help="Write every report into this directory as <input>_audit_findings.xlsx.")
+    ap.add_argument("--combine", action="store_true",
+                    help="Pool ALL inputs into one population and write a single combined "
+                         "audit; each finding is tagged with its source folder.")
     ap.add_argument("--threshold", type=int, default=85,
                     help="Fuzzy cutoff 0-100 for grouping equivalent questions (default 85).")
     ap.add_argument("--answer-threshold", type=int, default=80,
@@ -604,10 +628,22 @@ def main() -> None:
         for p in missing:
             print(f"Input not found: {p}", file=sys.stderr)
         sys.exit(1)
-    if args.output and len(inputs) > 1:
-        ap.error("-o/--output takes a single input; use --out-dir for multiple inputs.")
+    if args.output and len(inputs) > 1 and not args.combine:
+        ap.error("-o/--output takes a single input; use --out-dir, or --combine for one pooled audit.")
     if args.out_dir:
         Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+
+    if args.combine:
+        labeled = akj.unique_sources(inputs)
+        print(f"\n=== combined: pooling {len(inputs)} input(s) "
+              f"[{', '.join(l for _, l in labeled)}] ===")
+        out_path = (Path(args.output) if args.output
+                    else (Path(args.out_dir) if args.out_dir else Path("."))
+                    / "combined_audit_findings.xlsx")
+        sheets = run_audit_combined(labeled, treat_as_blank=args.treat_as_blank, **_audit_kw(args))
+        _emit(sheets, out_path, args, title=f"KYD Audit — combined ({len(inputs)} folders)")
+        print(f"\n[DONE] 1 combined audit written.\n  - {out_path.resolve()}")
+        return
 
     written: list[Path] = []
     for in_path, out_path in akj._plan_outputs(inputs, args.output, args.out_dir,
