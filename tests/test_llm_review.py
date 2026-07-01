@@ -55,10 +55,35 @@ def test_build_df_only_keeps_outliers_meeting_min_severity():
     assert df.iloc[0]["risk_flags"] == "na"
     assert df.iloc[0]["canonical_question"] == "Describe your AML programme."
 
+def test_offenum_severity_normalized_to_high_and_survives_high_gate():
+    # LLM returns an off-enum severity ("critical"); it must be normalized to
+    # "high" at ingestion so it is NOT silently dropped under min_severity=high.
+    slots = {0: [_rec("f0", "We refuse to answer.")]}
+    content = json.dumps({"answers": [
+        {"file": "f0", "is_outlier": True, "category": "evasive", "severity": "critical",
+         "rationale": "refusal"},
+    ]})
+    verdicts = ar.llm_review(slots, {0}, CANON, FakeChat(content), LLM_CFG)
+    assert verdicts[0]["severity"] == "high"
+    df = ar.build_llm_review_df(verdicts, [], {}, CANON, {"min_severity": "high"})
+    assert list(df["file_name"]) == ["f0"]
+    assert df.iloc[0]["severity"] == "high"
+
+def test_offenum_category_normalized_to_none():
+    slots = {0: [_rec("f0", "Some answer.")]}
+    content = json.dumps({"answers": [
+        {"file": "f0", "is_outlier": True, "category": "risky", "severity": "low",
+         "rationale": "unclear"},
+    ]})
+    verdicts = ar.llm_review(slots, {0}, CANON, FakeChat(content), LLM_CFG)
+    assert verdicts[0]["category"] == "none"
+
 if __name__ == "__main__":
     test_gate_includes_risk_only_slot()
     test_gate_includes_vote_slot()
     test_llm_review_parses_and_filters()
     test_malformed_json_skips_slot_without_crash()
     test_build_df_only_keeps_outliers_meeting_min_severity()
+    test_offenum_severity_normalized_to_high_and_survives_high_gate()
+    test_offenum_category_normalized_to_none()
     print("OK")

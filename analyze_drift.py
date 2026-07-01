@@ -529,7 +529,7 @@ def run_llm_review_stage(slots, det_outliers, canon, *, cfg, llm_cfg):
         susp = answer_review.suspicious_slots(det_outliers, rmap)
         verdicts = answer_review.llm_review(slots, susp, canon, chat, llm_cfg)
         return answer_review.build_llm_review_df(verdicts, det_outliers, rmap, canon, llm_cfg)
-    except Exception as exc:  # noqa: BLE001
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 - SystemExit: azure_api_key raises this on missing key
         print(f"WARN: llm-review unavailable ({exc}); skipping.", file=sys.stderr)
         return pd.DataFrame(columns=answer_review.LLM_COLS)
 

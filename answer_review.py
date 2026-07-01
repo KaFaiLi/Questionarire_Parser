@@ -53,6 +53,22 @@ LLM_COLS = ["slot_id", "canonical_question", "file_name", "response",
             "det_votes", "det_methods", "risk_flags"]
 
 _SEV_ORDER = {"low": 0, "med": 1, "high": 2}
+_SEV_SYNONYMS = {"critical": "high", "crit": "high", "medium": "med", "moderate": "med", "minor": "low"}
+_CATEGORIES = {"peer", "evasive", "gap", "contradiction", "none"}
+
+
+def _norm_verdict(cat, sev):
+    """Normalize LLM-returned category/severity to their enums so downstream
+    filtering never sees an off-enum value. Off-enum severity fails safe to
+    "high" (surface rather than silently drop); off-enum category falls back
+    to "none"."""
+    sev = _SEV_SYNONYMS.get(str(sev).strip().lower(), str(sev).strip().lower())
+    if sev not in _SEV_ORDER:
+        sev = "high"
+    cat = str(cat).strip().lower()
+    if cat not in _CATEGORIES:
+        cat = "none"
+    return cat, sev
 
 _PROMPT = """You audit KYD questionnaire answers. For ONE question you are given every firm's free-text answer.
 Flag an answer as an outlier if EITHER:
@@ -97,11 +113,12 @@ def llm_review(slots, susp_ids, canon, chat, llm_cfg) -> list:
                 fn = a["file"]
                 if fn not in by_file:
                     continue
+                cat, sev = _norm_verdict(a.get("category", "none"), a.get("severity", "low"))
                 out.append({
                     "slot_id": sid, "file_name": fn, "response": by_file[fn],
                     "is_outlier": bool(a.get("is_outlier")),
-                    "category": a.get("category", "none"),
-                    "severity": a.get("severity", "low"),
+                    "category": cat,
+                    "severity": sev,
                     "rationale": a.get("rationale", ""),
                 })
         except Exception as exc:  # noqa: BLE001 - best-effort per slot
