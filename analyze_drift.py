@@ -50,7 +50,7 @@ def make_embeddings(cfg: dict):
         azure_endpoint=az["endpoint"],
         azure_deployment=az["embedding_deployment"],
         api_version=az["api_version"],
-        api_key=az["api_key"],
+        api_key=akj.azure_api_key(az),
     )
 
 

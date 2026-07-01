@@ -115,6 +115,14 @@ def read_text(p, encoding: str = "utf-8") -> str:
         return fh.read()
 
 
+def azure_api_key(az: dict) -> str:
+    """Prefer the AZURE_OPENAI_API_KEY env var; fall back to config.yaml's azure.api_key."""
+    key = os.environ.get("AZURE_OPENAI_API_KEY") or az.get("api_key")
+    if not key:
+        raise SystemExit("Azure key missing: set AZURE_OPENAI_API_KEY or azure.api_key in config.yaml")
+    return key
+
+
 def write_text(p, data: str, encoding: str = "utf-8") -> None:
     ensure_parent(p)
     with open(longpath(p), "w", encoding=encoding) as fh:

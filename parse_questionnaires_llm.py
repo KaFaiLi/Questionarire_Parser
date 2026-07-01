@@ -20,6 +20,8 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, Field
 
+import analyze_kyd_json as akj
+
 DEPLOYMENTS = {"nano": "gpt-4.1-nano", "full": "gpt-4.1"}
 
 
@@ -101,7 +103,7 @@ def make_llm(model: str, cfg: dict):
         azure_endpoint=az["endpoint"],
         azure_deployment=DEPLOYMENTS[model],
         api_version=az["api_version"],
-        api_key=az["api_key"],
+        api_key=akj.azure_api_key(az),
         temperature=0,
         max_tokens=4096,
     )
