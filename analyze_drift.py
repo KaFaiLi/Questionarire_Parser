@@ -249,6 +249,67 @@ def assign_clusters(units: list[dict], vecs: dict, ct: float):
     return assign, canon
 
 
+def near_miss_pairs(units: list[dict], assign: dict, canon: dict, vecs: dict,
+                    ct: float, floor: float) -> list[dict]:
+    """Same-level cluster pairs whose canonicals sit just below ct (in [floor, ct)).
+    Surfaces logical questions the hard threshold wrongly split into two clusters so a
+    human can force a merge via --merge-map. Sorted closest-to-merging first."""
+    from collections import Counter
+    meta = {}  # cid -> {level, files:set, n}
+    for u in units:
+        cid = assign[(u["level"], u["text"])]
+        m = meta.setdefault(cid, {"level": u["level"], "files": set(), "n": 0})
+        m["files"].add(u["file_name"]); m["n"] += 1
+    cids = sorted(meta)
+    rows = []
+    for a_i in range(len(cids)):
+        for b_i in range(a_i + 1, len(cids)):
+            ca, cb = cids[a_i], cids[b_i]
+            if meta[ca]["level"] != meta[cb]["level"]:
+                continue
+            c = cos(vecs[canon[ca]], vecs[canon[cb]])
+            if floor <= c < ct:
+                rows.append({"level": meta[ca]["level"], "cosine": round(c, 4),
+                             "cluster_a": ca, "cluster_b": cb,
+                             "canon_a": canon[ca], "canon_b": canon[cb],
+                             "files_a": len(meta[ca]["files"]), "files_b": len(meta[cb]["files"]),
+                             "n_a": meta[ca]["n"], "n_b": meta[cb]["n"]})
+    return sorted(rows, key=lambda r: -r["cosine"])
+
+
+def apply_merge_map(units, assign, canon, merges: list[list[str]]):
+    """Force-union clusters listed in the merge-map (each entry = a group of canonical
+    texts that mean the same question). Keyed on text, not cluster id, because ids
+    renumber every run. Returns fresh (assign, canon) with groups collapsed and each
+    merged cluster's canonical recomputed as its most-frequent wording."""
+    from collections import Counter
+    parent = {}
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]; x = parent[x]
+        return x
+    def union(a, b):
+        parent[find(a)] = find(b)
+    # map each merge-group text to every cid it appears under, then union them
+    text_cids = {}
+    for (level, text), cid in assign.items():
+        text_cids.setdefault(text, set()).add(cid)
+    for group in merges:
+        cids = [c for t in group for c in text_cids.get(t, ())]
+        for c in cids[1:]:
+            union(cids[0], c)
+    new_assign = {k: find(v) for k, v in assign.items()}
+    groups = {}
+    for u in units:
+        groups.setdefault(new_assign[(u["level"], u["text"])], []).append(u)
+    new_canon = {}
+    for cid, gunits in groups.items():
+        counts = Counter(u["text"] for u in gunits)
+        new_canon[cid] = sorted(counts, key=lambda t: (-counts[t], -len(t), t))[0]
+    return new_assign, new_canon
+
+
 def build_rows(units: list[dict], vecs: dict, assign: dict, canon: dict, drift_threshold: float) -> list[dict]:
     from collections import Counter
     by_cid = {}
@@ -428,30 +489,30 @@ def extract_answers_many(labeled: list[tuple[Path, str]]) -> list[dict]:
     return recs
 
 
-def analyze_drift_one(in_dir: Path, out: Path, *, cfg, ct, dt, ocfg,
+def analyze_drift_one(in_dir: Path, out: Path, *, cfg, ct, dt, ocfg, nm_floor, merges,
                       embeddings, cache_path: Path, workers: int) -> bool:
     """Per-folder run: extract this folder only, then build the report."""
     units = extract_units(in_dir)
     answer_recs = extract_answers(in_dir)
     return _drift_report(units, answer_recs, out, label=str(in_dir), ct=ct, dt=dt,
-                         ocfg=ocfg, embeddings=embeddings, cache_path=cache_path,
-                         workers=workers)
+                         ocfg=ocfg, nm_floor=nm_floor, merges=merges,
+                         embeddings=embeddings, cache_path=cache_path, workers=workers)
 
 
 def analyze_drift_combined(labeled: list[tuple[Path, str]], out: Path, *, cfg, ct, dt,
-                           ocfg, embeddings, cache_path: Path, workers: int) -> bool:
+                           ocfg, nm_floor, merges, embeddings, cache_path: Path, workers: int) -> bool:
     """Pool every folder into ONE population (source-tagged file ids) and build a
     single combined report."""
     units = extract_units_many(labeled)
     answer_recs = extract_answers_many(labeled)
     return _drift_report(units, answer_recs, out,
                          label=f"combined ({len(labeled)} folders)", ct=ct, dt=dt,
-                         ocfg=ocfg, embeddings=embeddings, cache_path=cache_path,
-                         workers=workers)
+                         ocfg=ocfg, nm_floor=nm_floor, merges=merges,
+                         embeddings=embeddings, cache_path=cache_path, workers=workers)
 
 
 def _drift_report(units: list[dict], answer_recs: list[dict], out: Path, *, label,
-                  ct, dt, ocfg, embeddings, cache_path: Path, workers: int) -> bool:
+                  ct, dt, ocfg, nm_floor, merges, embeddings, cache_path: Path, workers: int) -> bool:
     """Embed -> cluster -> drift rows + outliers -> xlsx + two HTML matrices,
     for units/answers from one folder or several pooled together. The
     consensus canonical wording is computed over whatever is passed in."""
@@ -468,6 +529,9 @@ def _drift_report(units: list[dict], answer_recs: list[dict], out: Path, *, labe
     vecs = embed_texts(all_texts, embeddings, workers, cache_path)
 
     assign, canon = assign_clusters(units, vecs, ct)
+    near_miss = near_miss_pairs(units, assign, canon, vecs, ct, nm_floor)
+    if merges:
+        assign, canon = apply_merge_map(units, assign, canon, merges)
     rows = build_rows(units, vecs, assign, canon, dt)
 
     slots = group_by_slot(answer_recs, assign)
@@ -485,10 +549,15 @@ def _drift_report(units: list[dict], answer_recs: list[dict], out: Path, *, labe
         ["file_name", "question_id"]) if outliers else pd.DataFrame(columns=OUT_COLS)
     df_flags = pd.DataFrame(flags, columns=["file_name", "n_outliers", "flagged", "questions"])
 
+    NM_COLS = ["level", "cosine", "cluster_a", "cluster_b", "canon_a", "canon_b",
+               "files_a", "files_b", "n_a", "n_b"]
+    df_nm = pd.DataFrame(near_miss, columns=NM_COLS)
+
     with pd.ExcelWriter(akj.longpath(out)) as xl:
         df.to_excel(xl, sheet_name="drift", index=False)
         df_out.to_excel(xl, sheet_name="answer_outliers", index=False)
         df_flags.to_excel(xl, sheet_name="questionnaire_flags", index=False)
+        df_nm.to_excel(xl, sheet_name="suspected_merges", index=False)
 
     html_out = out.with_suffix(".html")
     # derive the outlier-matrix name from this report's stem so multiple folders
@@ -501,6 +570,8 @@ def _drift_report(units: list[dict], answer_recs: list[dict], out: Path, *, labe
     n_drift = int(df["is_drift"].sum())
     print(f"clusters: {n_clusters}  |  drift rows: {n_drift}  "
           f"(cluster_threshold={ct}, drift_threshold={dt})")
+    print(f"suspected_merges: {len(near_miss)} same-level pairs in [{nm_floor}, {ct}) "
+          f"-- review the sheet, add real splits to --merge-map")
     print(f"outliers: {len(outliers)} answers  |  flagged questionnaires: "
           f"{int(df_flags['flagged'].sum())}/{len(df_flags)} (min_votes={ocfg['min_votes']}, "
           f"multi_outlier_n={ocfg['multi_outlier_n']})")
@@ -526,11 +597,17 @@ def main() -> None:
     ap.add_argument("--min-votes", type=int, help="override outliers.min_votes")
     ap.add_argument("--multi-outlier-n", type=int, help="override outliers.multi_outlier_n")
     ap.add_argument("--answer-threshold", type=float, help="override outliers.answer_threshold")
+    ap.add_argument("--near-miss-floor", type=float, help="override drift.near_miss_floor")
+    ap.add_argument("--merge-map", default=None,
+                    help="YAML with a `merges:` list of canonical-text groups to force-union")
     args = ap.parse_args()
 
     cfg = load_config()
     ct = args.cluster_threshold if args.cluster_threshold is not None else cfg["drift"]["cluster_threshold"]
     dt = args.drift_threshold if args.drift_threshold is not None else cfg["drift"]["drift_threshold"]
+    nm_floor = (args.near_miss_floor if args.near_miss_floor is not None
+                else cfg["drift"].get("near_miss_floor", 0.75))
+    merges = yaml.safe_load(akj.read_text(args.merge_map)).get("merges", []) if args.merge_map else []
     ocfg = dict(cfg["outliers"])
     if args.min_votes is not None: ocfg["min_votes"] = args.min_votes
     if args.multi_outlier_n is not None: ocfg["multi_outlier_n"] = args.multi_outlier_n
@@ -558,6 +635,7 @@ def main() -> None:
                else (Path(args.out_dir) if args.out_dir else Path("."))
                / "combined_drift_analysis.xlsx")
         ok = analyze_drift_combined(labeled, out, cfg=cfg, ct=ct, dt=dt, ocfg=ocfg,
+                                    nm_floor=nm_floor, merges=merges,
                                     embeddings=embeddings, cache_path=cache_path,
                                     workers=args.workers)
         print(f"\n[DONE] {int(ok)} combined report written.")
@@ -568,6 +646,7 @@ def main() -> None:
     written: list[Path] = []
     for in_dir, out in akj._plan_outputs(inputs, args.out, args.out_dir, "drift_analysis.xlsx"):
         if analyze_drift_one(in_dir, out, cfg=cfg, ct=ct, dt=dt, ocfg=ocfg,
+                             nm_floor=nm_floor, merges=merges,
                              embeddings=embeddings, cache_path=cache_path, workers=args.workers):
             written.append(out)
 
