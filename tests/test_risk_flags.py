@@ -30,7 +30,18 @@ def test_short_answer_relative_to_slot():
     assert "short" in flags[(0, "f4", "ok")]
     assert (0, "f0", long) not in flags
 
+def test_anchor_text_rule_match():
+    # Rule matches via anchor_text, not canonical question
+    rules = [{"id": "RF-COMP", "description": "compliance neg", "severity": "high",
+              "q_re": re.compile(r"compliance", re.I), "a_re": re.compile(r"^\s*no\b", re.I)}]
+    # CANON has no "compliance" text; rule will not match via canonical path
+    slots = {0: [{"file_name": "f0", "question_id": "Q1", "anchor_level": "prompt",
+                  "anchor_text": "Compliance programme in place?", "response": "no", "slot_id": 0}]}
+    flags = ar.risk_flags(slots, rules, {0: "Generic question?"})
+    assert "RF-COMP" in flags[(0, "f0", "no")]
+
 if __name__ == "__main__":
     test_na_and_negation_and_hedge_trip()
     test_short_answer_relative_to_slot()
+    test_anchor_text_rule_match()
     print("OK")

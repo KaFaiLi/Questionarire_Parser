@@ -9,7 +9,6 @@ import json
 import re
 import sys
 import statistics
-from collections import Counter
 
 _NA = {"", "n/a", "na", "n.a.", "nil", "none", "-", "not applicable"}
 _NEG = re.compile(r"^\s*(no|not|never|none)\b", re.I)
