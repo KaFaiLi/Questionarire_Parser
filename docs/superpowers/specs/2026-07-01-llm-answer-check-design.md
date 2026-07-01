@@ -111,7 +111,9 @@ answer_recs → slots → { detect_outliers , risk_flags }
 
 ## Error handling
 
-- No `--llm-review` flag → stage skipped, run is byte-identical to today.
+- No `--llm-review` flag → LLM stage skipped. The `llm_answer_review` sheet is still
+  written but empty (columns only), so every run yields a consistent workbook shape.
+  Existing sheets and HTML are unchanged.
 - LLM unavailable or a call throws → best-effort per slot: warn to stderr, skip that slot,
   keep all deterministic output. Mirrors the existing `--use-embeddings` degrade pattern.
   No data loss.

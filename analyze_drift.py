@@ -31,8 +31,11 @@ from pathlib import Path
 import yaml
 
 import analyze_kyd_json as akj  # reuse _plan_outputs for consistent multi-input output naming
+import answer_review
 
 FIELDS_TEXT = {"prompt": "prompt", "option_label": "option"}  # sub-question field -> level
+
+DEFAULT_LLM_CFG = {"deployment": "gpt-4.1-nano", "min_severity": "low", "max_answers_per_slot": 40}
 
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -50,7 +53,7 @@ def make_embeddings(cfg: dict):
         azure_endpoint=az["endpoint"],
         azure_deployment=az["embedding_deployment"],
         api_version=az["api_version"],
-        api_key=az["api_key"],
+        api_key=akj.azure_api_key(az),
     )
 
 
@@ -490,29 +493,50 @@ def extract_answers_many(labeled: list[tuple[Path, str]]) -> list[dict]:
 
 
 def analyze_drift_one(in_dir: Path, out: Path, *, cfg, ct, dt, ocfg, nm_floor, merges,
-                      embeddings, cache_path: Path, workers: int) -> bool:
+                      embeddings, cache_path: Path, workers: int, llm_cfg=None) -> bool:
     """Per-folder run: extract this folder only, then build the report."""
     units = extract_units(in_dir)
     answer_recs = extract_answers(in_dir)
-    return _drift_report(units, answer_recs, out, label=str(in_dir), ct=ct, dt=dt,
+    return _drift_report(units, answer_recs, out, label=str(in_dir), cfg=cfg, ct=ct, dt=dt,
                          ocfg=ocfg, nm_floor=nm_floor, merges=merges,
-                         embeddings=embeddings, cache_path=cache_path, workers=workers)
+                         embeddings=embeddings, cache_path=cache_path, workers=workers,
+                         llm_cfg=llm_cfg)
 
 
 def analyze_drift_combined(labeled: list[tuple[Path, str]], out: Path, *, cfg, ct, dt,
-                           ocfg, nm_floor, merges, embeddings, cache_path: Path, workers: int) -> bool:
+                           ocfg, nm_floor, merges, embeddings, cache_path: Path, workers: int,
+                           llm_cfg=None) -> bool:
     """Pool every folder into ONE population (source-tagged file ids) and build a
     single combined report."""
     units = extract_units_many(labeled)
     answer_recs = extract_answers_many(labeled)
     return _drift_report(units, answer_recs, out,
-                         label=f"combined ({len(labeled)} folders)", ct=ct, dt=dt,
+                         label=f"combined ({len(labeled)} folders)", cfg=cfg, ct=ct, dt=dt,
                          ocfg=ocfg, nm_floor=nm_floor, merges=merges,
-                         embeddings=embeddings, cache_path=cache_path, workers=workers)
+                         embeddings=embeddings, cache_path=cache_path, workers=workers,
+                         llm_cfg=llm_cfg)
 
 
-def _drift_report(units: list[dict], answer_recs: list[dict], out: Path, *, label,
-                  ct, dt, ocfg, nm_floor, merges, embeddings, cache_path: Path, workers: int) -> bool:
+def run_llm_review_stage(slots, det_outliers, canon, *, cfg, llm_cfg):
+    """Build the llm_answer_review DataFrame. Best-effort: any failure warns and
+    returns an empty frame so deterministic output is never lost."""
+    import pandas as pd
+    import audit_kyd  # lazy: audit_kyd imports analyze_drift, avoid circular top-level import
+    try:
+        chat = answer_review.make_chat(cfg, llm_cfg)
+        rules = audit_kyd.load_rules(None)
+        rmap = answer_review.risk_flags(slots, rules, canon)
+        susp = answer_review.suspicious_slots(det_outliers, rmap)
+        verdicts = answer_review.llm_review(slots, susp, canon, chat, llm_cfg)
+        return answer_review.build_llm_review_df(verdicts, det_outliers, rmap, canon, llm_cfg)
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 - SystemExit: azure_api_key raises this on missing key
+        print(f"WARN: llm-review unavailable ({exc}); skipping.", file=sys.stderr)
+        return pd.DataFrame(columns=answer_review.LLM_COLS)
+
+
+def _drift_report(units: list[dict], answer_recs: list[dict], out: Path, *, label, cfg,
+                  ct, dt, ocfg, nm_floor, merges, embeddings, cache_path: Path, workers: int,
+                  llm_cfg=None) -> bool:
     """Embed -> cluster -> drift rows + outliers -> xlsx + two HTML matrices,
     for units/answers from one folder or several pooled together. The
     consensus canonical wording is computed over whatever is passed in."""
@@ -549,6 +573,10 @@ def _drift_report(units: list[dict], answer_recs: list[dict], out: Path, *, labe
         ["file_name", "question_id"]) if outliers else pd.DataFrame(columns=OUT_COLS)
     df_flags = pd.DataFrame(flags, columns=["file_name", "n_outliers", "flagged", "questions"])
 
+    df_llm = (run_llm_review_stage(slots, outliers, canon, cfg=cfg, llm_cfg=llm_cfg)
+              if llm_cfg is not None else
+              pd.DataFrame(columns=answer_review.LLM_COLS))
+
     NM_COLS = ["level", "cosine", "cluster_a", "cluster_b", "canon_a", "canon_b",
                "files_a", "files_b", "n_a", "n_b"]
     df_nm = pd.DataFrame(near_miss, columns=NM_COLS)
@@ -558,6 +586,7 @@ def _drift_report(units: list[dict], answer_recs: list[dict], out: Path, *, labe
         df_out.to_excel(xl, sheet_name="answer_outliers", index=False)
         df_flags.to_excel(xl, sheet_name="questionnaire_flags", index=False)
         df_nm.to_excel(xl, sheet_name="suspected_merges", index=False)
+        df_llm.to_excel(xl, sheet_name="llm_answer_review", index=False)
 
     html_out = out.with_suffix(".html")
     # derive the outlier-matrix name from this report's stem so multiple folders
@@ -575,6 +604,8 @@ def _drift_report(units: list[dict], answer_recs: list[dict], out: Path, *, labe
     print(f"outliers: {len(outliers)} answers  |  flagged questionnaires: "
           f"{int(df_flags['flagged'].sum())}/{len(df_flags)} (min_votes={ocfg['min_votes']}, "
           f"multi_outlier_n={ocfg['multi_outlier_n']})")
+    if llm_cfg is not None:
+        print(f"llm-review: {len(df_llm)} flagged answers (min_severity={llm_cfg['min_severity']})")
     print(f"wrote {out}\nwrote {html_out}\nwrote {outlier_html}")
     return True
 
@@ -600,6 +631,8 @@ def main() -> None:
     ap.add_argument("--near-miss-floor", type=float, help="override drift.near_miss_floor")
     ap.add_argument("--merge-map", default=None,
                     help="YAML with a `merges:` list of canonical-text groups to force-union")
+    ap.add_argument("--llm-review", action="store_true",
+                    help="LLM pass over suspicious slots for peer/intrinsic-risk outliers (needs config.yaml azure creds)")
     args = ap.parse_args()
 
     cfg = load_config()
@@ -612,6 +645,7 @@ def main() -> None:
     if args.min_votes is not None: ocfg["min_votes"] = args.min_votes
     if args.multi_outlier_n is not None: ocfg["multi_outlier_n"] = args.multi_outlier_n
     if args.answer_threshold is not None: ocfg["answer_threshold"] = args.answer_threshold
+    llm_cfg = {**DEFAULT_LLM_CFG, **cfg.get("llm_review", {})} if args.llm_review else None
 
     inputs = [Path(p) for p in args.in_dirs]
     missing = [p for p in inputs if not akj.path_exists(p)]
@@ -637,7 +671,7 @@ def main() -> None:
         ok = analyze_drift_combined(labeled, out, cfg=cfg, ct=ct, dt=dt, ocfg=ocfg,
                                     nm_floor=nm_floor, merges=merges,
                                     embeddings=embeddings, cache_path=cache_path,
-                                    workers=args.workers)
+                                    workers=args.workers, llm_cfg=llm_cfg)
         print(f"\n[DONE] {int(ok)} combined report written.")
         if ok:
             print(f"  - {out.resolve()}")
@@ -647,7 +681,8 @@ def main() -> None:
     for in_dir, out in akj._plan_outputs(inputs, args.out, args.out_dir, "drift_analysis.xlsx"):
         if analyze_drift_one(in_dir, out, cfg=cfg, ct=ct, dt=dt, ocfg=ocfg,
                              nm_floor=nm_floor, merges=merges,
-                             embeddings=embeddings, cache_path=cache_path, workers=args.workers):
+                             embeddings=embeddings, cache_path=cache_path, workers=args.workers,
+                             llm_cfg=llm_cfg):
             written.append(out)
 
     print(f"\n[DONE] {len(written)}/{len(inputs)} report(s) written.")
