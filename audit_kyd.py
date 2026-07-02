@@ -60,6 +60,7 @@ import math
 import re
 import sys
 from collections import Counter
+from functools import lru_cache
 from pathlib import Path
 
 import pandas as pd
@@ -104,9 +105,13 @@ _DEFAULT_RULES = [
 
 
 # ── Rule loading / engine ──────────────────────────────────────────────────────
+@lru_cache(maxsize=None)
 def load_rules(path: str | None) -> list[dict]:
     """Load red-flag rules from YAML; fall back to audit_rules.yaml next to this
-    script, then to the embedded defaults. Each rule's patterns are compiled."""
+    script, then to the embedded defaults. Each rule's patterns are compiled.
+
+    Cached per path: a single run loads/compiles the rules once even when
+    several folders are audited. Callers treat the returned list as read-only."""
     import yaml
     raw = None
     candidates = [path] if path else []

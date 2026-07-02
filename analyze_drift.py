@@ -518,9 +518,12 @@ def analyze_drift_combined(labeled: list[tuple[Path, str]], out: Path, *, cfg, c
 
 
 def run_llm_review_stage(slots, det_outliers, canon, *, cfg, llm_cfg):
-    """Build the llm_answer_review DataFrame. Best-effort: any failure warns and
-    returns an empty frame so deterministic output is never lost."""
+    """Build the llm_answer_review DataFrame. Returns an empty frame when the
+    feature is off (llm_cfg is None). Best-effort otherwise: any failure warns
+    and returns an empty frame so deterministic output is never lost."""
     import pandas as pd
+    if llm_cfg is None:
+        return pd.DataFrame(columns=answer_review.LLM_COLS)
     import audit_kyd  # lazy: audit_kyd imports analyze_drift, avoid circular top-level import
     try:
         chat = answer_review.make_chat(cfg, llm_cfg)
@@ -573,9 +576,7 @@ def _drift_report(units: list[dict], answer_recs: list[dict], out: Path, *, labe
         ["file_name", "question_id"]) if outliers else pd.DataFrame(columns=OUT_COLS)
     df_flags = pd.DataFrame(flags, columns=["file_name", "n_outliers", "flagged", "questions"])
 
-    df_llm = (run_llm_review_stage(slots, outliers, canon, cfg=cfg, llm_cfg=llm_cfg)
-              if llm_cfg is not None else
-              pd.DataFrame(columns=answer_review.LLM_COLS))
+    df_llm = run_llm_review_stage(slots, outliers, canon, cfg=cfg, llm_cfg=llm_cfg)
 
     NM_COLS = ["level", "cosine", "cluster_a", "cluster_b", "canon_a", "canon_b",
                "files_a", "files_b", "n_a", "n_b"]

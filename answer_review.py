@@ -26,6 +26,11 @@ def risk_flags(slots, rules, canon) -> dict:
         lengths = [len(r["response"]) for r in recs]
         med = statistics.median(lengths) if lengths else 0
         qtext = canon.get(sid, "")
+        # A rule's q_re match against the canonical question is constant for the
+        # whole slot; compute it once instead of per answer. When False we still
+        # fall back to the per-answer anchor_text check below.
+        q_canon_hit = [rule.get("q_re") is None or bool(rule["q_re"].search(qtext))
+                       for rule in rules]
         for r in recs:
             resp = r["response"]
             labels = []
@@ -38,8 +43,8 @@ def risk_flags(slots, rules, canon) -> dict:
             # short only when the slot's typical answer is substantial (avoid all-short slots)
             if med >= 20 and len(resp) < 0.4 * med:
                 labels.append("short")
-            for rule in rules:
-                if rule.get("q_re") and not rule["q_re"].search(qtext) and not rule["q_re"].search(r["anchor_text"]):
+            for rule, canon_hit in zip(rules, q_canon_hit):
+                if not canon_hit and not rule["q_re"].search(r["anchor_text"]):
                     continue
                 if rule["a_re"].search(resp):
                     labels.append(rule["id"])
@@ -62,7 +67,8 @@ def _norm_verdict(cat, sev):
     filtering never sees an off-enum value. Off-enum severity fails safe to
     "high" (surface rather than silently drop); off-enum category falls back
     to "none"."""
-    sev = _SEV_SYNONYMS.get(str(sev).strip().lower(), str(sev).strip().lower())
+    s = str(sev).strip().lower()
+    sev = _SEV_SYNONYMS.get(s, s)
     if sev not in _SEV_ORDER:
         sev = "high"
     cat = str(cat).strip().lower()
@@ -132,7 +138,7 @@ def build_llm_review_df(verdicts, det_outliers, rmap, canon, llm_cfg):
     det_by = {(o["slot_id"], o["file_name"]): o for o in det_outliers}
     rows = []
     for v in verdicts:
-        if not v["is_outlier"] or _SEV_ORDER.get(v["severity"], 0) < floor:
+        if not v["is_outlier"] or _SEV_ORDER[v["severity"]] < floor:
             continue
         d = det_by.get((v["slot_id"], v["file_name"]), {})
         labels = rmap.get((v["slot_id"], v["file_name"], v["response"]), [])
