@@ -15,12 +15,11 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 from pathlib import Path
 
 import yaml
 from pydantic import BaseModel, Field
-
-import analyze_kyd_json as akj
 
 DEPLOYMENTS = {"nano": "gpt-4.1-nano", "full": "gpt-4.1"}
 
@@ -96,6 +95,14 @@ def load_config(path: str = "config.yaml") -> dict:
     return yaml.safe_load(Path(path).read_text(encoding="utf-8"))
 
 
+def azure_api_key(az: dict) -> str:
+    """Prefer the AZURE_OPENAI_API_KEY env var; fall back to config.yaml's azure.api_key."""
+    key = os.environ.get("AZURE_OPENAI_API_KEY") or az.get("api_key")
+    if not key:
+        raise SystemExit("Azure key missing: set AZURE_OPENAI_API_KEY or azure.api_key in config.yaml")
+    return key
+
+
 def make_llm(model: str, cfg: dict):
     from langchain_openai import AzureChatOpenAI
     az = cfg["azure"]
@@ -103,7 +110,7 @@ def make_llm(model: str, cfg: dict):
         azure_endpoint=az["endpoint"],
         azure_deployment=DEPLOYMENTS[model],
         api_version=az["api_version"],
-        api_key=akj.azure_api_key(az),
+        api_key=azure_api_key(az),
         temperature=0,
         max_tokens=4096,
     )
