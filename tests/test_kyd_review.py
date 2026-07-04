@@ -89,13 +89,13 @@ def test_xlsx_export(tmp_path):
     assert [ws.title for ws in wb] == ["Heatmap", "Question wording", "Findings", "Questions", "Answers"]
     assert wb["Findings"].max_row == len(REPORT["findings"]) + 1
     assert wb["Heatmap"].max_column == len(REPORT["clusters"]) + 1
-    # wording grid: one row per question, one column per firm (+ the Question column)
+    # wording grid: one row per firm, one column per question (+ the File column)
     wsw = wb["Question wording"]
-    assert wsw.max_row == len(REPORT["clusters"]) + 1
-    assert wsw.max_column == len(REPORT["files"]) + 1
+    assert wsw.max_row == len(REPORT["files"]) + 1
+    assert wsw.max_column == len(REPORT["clusters"]) + 1
     # a substantive cell (qvar==2) must be filled red
     for ci, row in enumerate(REPORT["qvar"]):
         for fi, code in enumerate(row):
             if code == 2:
-                assert wsw.cell(row=ci + 2, column=fi + 2).fill.start_color.rgb.endswith("D03B3B")
+                assert wsw.cell(row=fi + 2, column=ci + 2).fill.start_color.rgb.endswith("D03B3B")
                 return

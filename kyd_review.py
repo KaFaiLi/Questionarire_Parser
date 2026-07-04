@@ -461,6 +461,10 @@ h1 { font-size:20px; margin:0 0 4px; } h2 { font-size:16px; margin:28px 0 8px; }
 .tile { background:#fff; border:1px solid rgba(11,11,11,.10); border-radius:8px; padding:10px 16px; min-width:110px; }
 .tile b { display:block; font-size:24px; } .tile span { color:#52514e; font-size:12px; }
 .plot { background:#fff; border:1px solid rgba(11,11,11,.10); border-radius:8px; padding:8px; margin-bottom:8px; }
+.legend { display:flex; gap:16px; flex-wrap:wrap; margin:6px 0 10px; color:#52514e; font-size:12px; }
+.legend span { white-space:nowrap; }
+.legend i { display:inline-block; width:14px; height:14px; border-radius:3px; vertical-align:-2px;
+            margin-right:5px; border:1px solid rgba(11,11,11,.15); }
 ol { margin:8px 0; } #findings li { margin:4px 0; }
 .chip { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; color:#0b0b0b;
         border:1px solid rgba(11,11,11,.10); margin-right:6px; }
@@ -480,14 +484,14 @@ def _discrete_scale(colors: list[str]) -> list[list]:
     return cs
 
 
-def _heatmap(z, x, y, text, colors, names, xlab, ylab, hovertemplate):
+def _heatmap(z, x, y, text, colors, xlab, ylab, hovertemplate):
     import plotly.graph_objects as go
     n = len(colors)
+    # colour key lives in an HTML legend next to the figure, not on the graph
     fig = go.Figure(go.Heatmap(
         z=z, x=x, y=y, text=text, hovertemplate=hovertemplate,
         zmin=0, zmax=n, colorscale=_discrete_scale(colors), xgap=1, ygap=1,
-        colorbar=dict(tickvals=[i + 0.5 for i in range(n)],
-                      ticktext=[names[i] for i in range(n)], thickness=14, ticks=""),
+        showscale=False,
     ))
     fig.update_layout(template="plotly_white", font=dict(size=11),
                       margin=dict(l=10, r=10, t=10, b=10),
@@ -501,6 +505,15 @@ def _heatmap(z, x, y, text, colors, names, xlab, ylab, hovertemplate):
 def _uniq_labels(titles: list[str], width: int) -> list[str]:
     # index-prefix keeps labels unique (plotly merges rows/cols with identical labels)
     return [f"{i + 1}. {t[:width]}" for i, t in enumerate(titles)]
+
+
+def _legend(colors: list[str], names: dict, absent: str | None = None) -> str:
+    """HTML colour key shown beside a heat map (plotly colorbar is turned off)."""
+    parts = [f'<span><i style="background:{c}"></i>{html.escape(names[i])}</span>'
+             for i, c in enumerate(colors)]
+    if absent:
+        parts.append(f'<span><i style="background:#ececec"></i>{html.escape(absent)}</span>')
+    return f'<div class="legend">{"".join(parts)}</div>'
 
 
 def render_html(report: dict) -> str:
@@ -521,7 +534,7 @@ def render_html(report: dict) -> str:
             zr.append(None if lv < 0 else lv)
             tr.append("" if lv < 0 else SEV_NAMES[lv])
         z1.append(zr); t1.append(tr)
-    fig1 = _heatmap(z1, _uniq_labels(ctitles, 34), files, t1, SEV_COLORS, SEV_NAMES,
+    fig1 = _heatmap(z1, _uniq_labels(ctitles, 34), files, t1, SEV_COLORS,
                     "canonical question", "questionnaire",
                     "%{y}<br>%{x}<br><b>%{text}</b><extra></extra>")
 
@@ -533,26 +546,29 @@ def render_html(report: dict) -> str:
             for f in v["files"]:
                 m[f] = v["text"]
         wording.append(m)
-    # hover keeps the status + this firm's actual wording (the value-add); firm (x)
-    # and question (y) come from the axes.
+    # transposed like the severity map: rows = questionnaires, cols = questions.
+    # hover keeps status + this firm's actual wording (the value-add); firm (y)
+    # and question (x) come from the axes.
     z2, t2 = [], []
-    for ci, row in enumerate(qvar):
+    for fi, fn in enumerate(files):
         zr, tr = [], []
-        for fi, lv in enumerate(row):
+        for ci in range(len(clusters)):
+            lv = qvar[ci][fi]
             if lv < 0:
                 zr.append(None); tr.append("")
             else:
                 zr.append(lv)
-                w = wording[ci].get(files[fi], "")
-                tr.append(f"<b>{WORD_NAMES[lv]}</b><br>{esc(w[:140])}")
+                tr.append(f"<b>{WORD_NAMES[lv]}</b><br>{esc(wording[ci].get(fn, '')[:140])}")
         z2.append(zr); t2.append(tr)
-    fig2 = _heatmap(z2, files, _uniq_labels(ctitles, 44), t2, WORD_COLORS, WORD_NAMES,
-                    "questionnaire", "canonical question",
-                    "%{x}<br>%{text}<extra></extra>")
+    fig2 = _heatmap(z2, _uniq_labels(ctitles, 34), files, t2, WORD_COLORS,
+                    "canonical question", "questionnaire",
+                    "%{y}<br>%{x}<br>%{text}<extra></extra>")
 
     cfg = {"displaylogo": False, "responsive": True}
     p1 = fig1.to_html(full_html=False, include_plotlyjs=True, config=cfg)
     p2 = fig2.to_html(full_html=False, include_plotlyjs=False, config=cfg)
+    legend1 = _legend(SEV_COLORS, SEV_NAMES, "question not expected in this file")
+    legend2 = _legend(WORD_COLORS, WORD_NAMES, "question not in this questionnaire")
 
     counts = Counter(g["level"] for g in report["findings"])
     tiles = (f'<div class="tile"><b>{len(files)}</b><span>questionnaires</span></div>'
@@ -578,9 +594,11 @@ def render_html(report: dict) -> str:
 <div class="tiles">{tiles}</div>
 <h2>Findings by questionnaire &times; question</h2>
 <p class="sub">Rows = questionnaires, columns = questions. Colour = worst issue found for that firm on that question.</p>
+{legend1}
 <div class="plot">{p1}</div>
 <h2>Question wording vs. majority</h2>
-<p class="sub">Rows = questions, columns = questionnaires. Green = same wording, yellow = formatting-only, red = substantially different.</p>
+<p class="sub">Rows = questionnaires, columns = questions. Green = same wording, yellow = formatting-only, red = substantially different.</p>
+{legend2}
 <div class="plot">{p2}</div>
 <h2>All findings</h2>
 {findings}
@@ -630,21 +648,21 @@ def render_xlsx(report: dict, path: Path) -> None:
     for c in ws[1][len(lead):]:
         c.alignment = Alignment(wrap_text=True, vertical="top")
 
-    # --- wording heat map (question x firm), mirrors the HTML's second heat map:
+    # --- wording heat map (firm x question), same layout as the HTML/Heatmap sheets:
     #     green = same as majority, yellow = formatting-only, red = substantially
     #     different, grey = question absent from that questionnaire ---
     WORD_FILLS = {0: "5CB85C", 1: "FAB219", 2: "D03B3B"}
     ABSENT_FILL = "ECECEC"
     qvar = report["qvar"]
     fnames = report["files"]
-    wsw = sheet("Question wording", ["Question"] + fnames,
-                [[titles[ci]] + [""] * len(fnames) for ci in range(len(clusters))],
-                [45] + [4] * len(fnames),
-                fills=lambda r: {fi + 2: WORD_FILLS.get(code, ABSENT_FILL)
-                                 for fi, code in enumerate(qvar[r])})
-    for c in wsw[1][1:]:  # rotate firm headers like the HTML column labels
-        c.alignment = Alignment(textRotation=90, vertical="bottom")
-    wsw.row_dimensions[1].height = 120
+    wsw = sheet("Question wording", lead + titles,
+                [([folders.get(fn, "")] if multi else []) + [fn] + [""] * len(clusters)
+                 for fn in fnames],
+                ([14] if multi else []) + [22] + [18] * len(titles),
+                fills=lambda r: {ci + off: WORD_FILLS.get(qvar[ci][r], ABSENT_FILL)
+                                 for ci in range(len(clusters))})
+    for c in wsw[1][len(lead):]:
+        c.alignment = Alignment(wrap_text=True, vertical="top")
 
     sheet("Findings", ["Severity", "Type", "File", "Question", "Detail"],
           [[LEVEL_NAMES[f["level"]], f["kind"], f["file"], titles[f["cluster"]], f["message"]]
