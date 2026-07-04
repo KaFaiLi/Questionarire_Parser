@@ -22,6 +22,7 @@ Output: one self-contained HTML report (heat map of files x questions with
 click-through drill-down) plus a console summary.
 
     python kyd_review.py --dir Demo/kyd_examples -o output/kyd_review.html
+    python kyd_review.py --dir //server/share/batch1 --dir //server/share/batch2 -o out.html
 
 Stdlib only.
 """
@@ -31,6 +32,7 @@ import argparse
 import difflib
 import html
 import json
+import os
 import re
 import statistics
 from collections import Counter
@@ -84,12 +86,47 @@ def q_signature(q: dict) -> str:
     return " ".join(p for p in parts if p)
 
 
-def load_files(paths: list[Path]) -> list[dict]:
-    out = []
-    for p in sorted(paths):
-        d = json.loads(p.read_text(encoding="utf-8"))
-        out.append({"name": d.get("file_name") or p.stem, "questions": d.get("questions", [])})
-    return out
+def _winlong(p: Path) -> Path:
+    """Extended-length form (\\\\?\\...) so paths over MAX_PATH (260 chars) work.
+
+    ponytail: string-prefix trick, not a general long-path fix (relative paths,
+    '.'/'..' segments still need resolve() first); good enough for UNC network
+    shares with deep folders, which is the actual failure seen.
+    """
+    if os.name != "nt":
+        return p
+    s = str(p)
+    if s.startswith("\\\\?\\"):
+        return p
+    rp = str(p.resolve())
+    return Path("\\\\?\\UNC\\" + rp[2:]) if rp.startswith("\\\\") else Path("\\\\?\\" + rp)
+
+
+def _glob_json(d: Path) -> list[Path]:
+    try:
+        return sorted(d.glob("*.json"))
+    except OSError:
+        return sorted(_winlong(d).glob("*.json"))
+
+
+def _read_json(p: Path) -> dict:
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError):
+        return json.loads(_winlong(p).read_text(encoding="utf-8"))
+
+
+def load_files(entries: list[tuple[Path, str | None]]) -> list[dict]:
+    """entries: (path, folder_stem_or_None). folder_stem set only when >1 --dir given."""
+    raw = []
+    for p, folder in sorted(entries, key=lambda e: (e[1] or "", e[0].name)):
+        d = _read_json(p)
+        raw.append({"raw_name": d.get("file_name") or p.stem, "folder": folder or "",
+                    "questions": d.get("questions", [])})
+    dupes = Counter(f["raw_name"] for f in raw)
+    for f in raw:
+        f["name"] = f["raw_name"] if dupes[f["raw_name"]] == 1 else f"{f['raw_name']} ({f['folder']})"
+    return raw
 
 
 # --- question matching -----------------------------------------------------
@@ -269,7 +306,7 @@ def check_answers(slot: dict, findings: list, ci: int) -> None:
 
 # --- analysis ---------------------------------------------------------------
 
-def analyze(files: list[dict]) -> dict:
+def analyze(files: list[dict], multi_folder: bool = False) -> dict:
     n_files = len(files)
     clusters = cluster_questions(files)
     findings: list[dict] = []
@@ -310,7 +347,9 @@ def analyze(files: list[dict]) -> dict:
             else:
                 cells[fn].append(max((g["level"] for g in per_cell.get((fn, ci), [])), default=OK))
     findings.sort(key=lambda g: (-g["level"], g["cluster"], g["file"]))
-    return {"files": fnames, "clusters": out_clusters, "cells": cells, "findings": findings}
+    folders = {f["name"]: f.get("folder", "") for f in files}
+    return {"files": fnames, "clusters": out_clusters, "cells": cells, "findings": findings,
+            "folders": folders, "multi_folder": multi_folder}
 
 
 # --- report -----------------------------------------------------------------
@@ -399,10 +438,12 @@ document.getElementById("legend").innerHTML =
 
 // heat map
 const heat = document.getElementById("heat");
-let h = "<thead><tr><th></th>" + R.clusters.map((c,i) =>
+const fcol = R.multi_folder ? "<th></th>" : "";
+let h = "<thead><tr><th></th>" + fcol + R.clusters.map((c,i) =>
   `<th><div onclick="showCluster(${i})" title="${esc(c.title)}">${esc(c.title.slice(0,28))}${c.title.length>28?"\\u2026":""}</div></th>`).join("") + "</tr></thead><tbody>";
 R.files.forEach(fn => {
-  h += `<tr><th>${esc(fn)}</th>` + R.cells[fn].map((lv,ci) => {
+  const frow = R.multi_folder ? `<th class="muted">${esc(R.folders[fn]||"")}</th>` : "";
+  h += `<tr><th>${esc(fn)}</th>${frow}` + R.cells[fn].map((lv,ci) => {
     if (lv < 0) return `<td class="cell na" title="not expected"></td>`;
     const t = `${fn} \\u00d7 ${R.clusters[ci].title.slice(0,60)}: ${NAME[lv]}`;
     return `<td class="cell l${lv}" id="c-${fn}-${ci}" title="${esc(t)}" onclick="showCell('${esc(fn)}',${ci})">${GLYPH[lv]}</td>`;
@@ -495,14 +536,19 @@ def render_xlsx(report: dict, path: Path) -> None:
 
     clusters = report["clusters"]
     titles = [c["title"] for c in clusters]
+    multi = report.get("multi_folder", False)
+    folders = report.get("folders", {})
+    lead = ["Folder", "File"] if multi else ["File"]
+    off = len(lead) + 1
 
-    ws = sheet("Heatmap", ["File"] + titles,
-               [[fn] + [("n/a" if lv < 0 else LEVEL_NAMES[lv]) for lv in report["cells"][fn]]
+    ws = sheet("Heatmap", lead + titles,
+               [([folders.get(fn, "")] if multi else []) + [fn] +
+                [("n/a" if lv < 0 else LEVEL_NAMES[lv]) for lv in report["cells"][fn]]
                 for fn in report["files"]],
-               [22] + [18] * len(titles),
-               fills=lambda r: {ci + 2: XLSX_FILLS[lv]
+               ([14] if multi else []) + [22] + [18] * len(titles),
+               fills=lambda r: {ci + off: XLSX_FILLS[lv]
                                 for ci, lv in enumerate(report["cells"][report["files"][r]]) if lv >= 0})
-    for c in ws[1][1:]:
+    for c in ws[1][len(lead):]:
         c.alignment = Alignment(wrap_text=True, vertical="top")
 
     sheet("Findings", ["Severity", "Type", "File", "Question", "Detail"],
@@ -533,17 +579,22 @@ def main() -> None:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("jsons", nargs="*", help="parsed questionnaire JSON files")
-    ap.add_argument("--dir", help="review every *.json in this directory")
+    ap.add_argument("--dir", action="append", metavar="DIR",
+                     help="review every *.json in this directory; repeat --dir to merge multiple source folders into one result")
     ap.add_argument("-o", "--out", default="output/kyd_review.html")
     args = ap.parse_args()
 
-    paths = [Path(p) for p in args.jsons]
-    if args.dir:
-        paths += sorted(Path(args.dir).glob("*.json"))
-    if len(paths) < 2:
-        ap.error("need at least 2 JSON files (pass paths or --dir)")
+    dirs = args.dir or []
+    multi_folder = len(dirs) > 1
+    entries = [(p, None) for p in (Path(p) for p in args.jsons)]
+    for d in dirs:
+        dp = Path(d)
+        stem = dp.resolve().name
+        entries += [(f, stem if multi_folder else None) for f in _glob_json(dp)]
+    if len(entries) < 2:
+        ap.error("need at least 2 JSON files (pass paths or --dir, repeatable)")
 
-    report = analyze(load_files(paths))
+    report = analyze(load_files(entries), multi_folder)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(render_html(report), encoding="utf-8")
