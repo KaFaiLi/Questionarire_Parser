@@ -3,7 +3,8 @@ from pathlib import Path
 
 import kyd_review as kr
 
-REPORT = kr.analyze(kr.load_files(sorted(Path("Demo/kyd_examples").glob("*.json"))))
+# difflib path: deterministic, no Azure needed (embeddings covered separately)
+REPORT = kr.analyze(kr.load_files([(p, None) for p in sorted(Path("Demo/kyd_examples").glob("*.json"))]))
 
 
 def _findings(kind=None, file=None):

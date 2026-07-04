@@ -24,13 +24,15 @@ click-through drill-down) plus a console summary.
     python kyd_review.py --dir Demo/kyd_examples -o output/kyd_review.html
     python kyd_review.py --dir //server/share/batch1 --dir //server/share/batch2 -o out.html
 
-Stdlib only.
+Questions are matched semantically via Azure OpenAI embeddings (cached on disk so
+re-runs are free); with --no-embed, or when no Azure key is configured, it falls
+back to a stdlib difflib text scan.
 """
 from __future__ import annotations
 
 import argparse
 import difflib
-import html
+import hashlib
 import json
 import os
 import re
@@ -76,6 +78,51 @@ def canon(s: str) -> str:
 
 def ratio(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+# --- embeddings (semantic question matching, with an on-disk cache) ----------
+
+def load_config(path: str = "config.yaml") -> dict:
+    import yaml
+    return yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+
+
+def _azure_key(az: dict) -> str | None:
+    return os.environ.get("AZURE_OPENAI_API_KEY") or az.get("api_key")
+
+
+def embed_signatures(sigs: list[str], cfg: dict, cache_path: Path) -> dict[str, list[float]]:
+    """Map each unique signature -> embedding vector.
+
+    Embeds only signatures not already in the JSON cache, so re-runs on the same
+    corpus cost nothing. Raises on Azure/import failure; callers fall back to difflib.
+    """
+    az = cfg["azure"]
+    key = _azure_key(az)
+    if not key:
+        raise RuntimeError("no Azure key (set AZURE_OPENAI_API_KEY or azure.api_key)")
+
+    cache: dict[str, list[float]] = {}
+    if cache_path.exists():
+        cache = json.loads(cache_path.read_text(encoding="utf-8"))
+
+    uniq = sorted(set(sigs))
+    keys = {s: hashlib.sha256(s.encode("utf-8")).hexdigest() for s in uniq}
+    missing = [s for s in uniq if keys[s] not in cache]
+    if missing:
+        from langchain_openai import AzureOpenAIEmbeddings
+        emb = AzureOpenAIEmbeddings(
+            azure_endpoint=az["endpoint"],
+            azure_deployment=az["embedding_deployment"],
+            api_version=az["api_version"],
+            api_key=key,
+        )
+        for vec, s in zip(emb.embed_documents(missing), missing):
+            cache[keys[s]] = vec
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(cache), encoding="utf-8")
+
+    return {s: cache[keys[s]] for s in uniq}
 
 
 def q_signature(q: dict) -> str:
@@ -131,28 +178,53 @@ def load_files(entries: list[tuple[Path, str | None]]) -> list[dict]:
 
 # --- question matching -----------------------------------------------------
 
-def cluster_questions(files: list[dict]) -> list[dict]:
-    """Greedy clustering of questions across files by signature similarity.
+def cluster_questions(files: list[dict], vecs: dict[str, list[float]] | None = None,
+                      threshold: float | None = None) -> list[dict]:
+    """Greedy clustering of questions across files.
 
-    ponytail: O(files x questions x clusters) difflib scan — fine for hundreds
-    of files; add a token-overlap prefilter if it ever gets slow.
+    With ``vecs`` (signature -> embedding) it matches by cosine similarity, so
+    paraphrases group together. Without it, falls back to a difflib character
+    scan (lexical only). Both keep one question per file per cluster.
+
+    ponytail: O(files x questions x clusters) scan — fine for hundreds of files;
+    add a blocking/ANN prefilter if it ever gets slow.
     """
+    embed = vecs is not None
+    thr = threshold if threshold is not None else (0.84 if embed else SIM_QUESTION)
+    if embed:
+        import numpy as np
+
+        def unit(s):
+            v = np.asarray(vecs[s], dtype=float)
+            n = np.linalg.norm(v)
+            return v / n if n else v
+
     clusters: list[dict] = []
-    for fi, f in enumerate(files):
+    for f in files:
         for pos, q in enumerate(f["questions"]):
             sig = norm(q_signature(q))
+            u = unit(sig) if embed else None
             best, best_r = None, 0.0
             for c in clusters:
                 if f["name"] in c["members"]:
                     continue  # one question per file per cluster
-                r = ratio(sig, c["sig"])
+                if embed:
+                    cen = c["vsum"]
+                    r = float(u @ (cen / (np.linalg.norm(cen) or 1)))
+                else:
+                    r = ratio(sig, c["sig"])
                 if r > best_r:
                     best, best_r = c, r
-            if best is not None and best_r >= SIM_QUESTION:
+            if best is not None and best_r >= thr:
                 best["members"][f["name"]] = q
                 best["positions"].append(pos)
+                if embed:
+                    best["vsum"] = best["vsum"] + u
             else:
-                clusters.append({"sig": sig, "members": {f["name"]: q}, "positions": [pos]})
+                c = {"sig": sig, "members": {f["name"]: q}, "positions": [pos]}
+                if embed:
+                    c["vsum"] = u.copy()
+                clusters.append(c)
     clusters.sort(key=lambda c: statistics.median(c["positions"]))
     return clusters
 
@@ -306,9 +378,10 @@ def check_answers(slot: dict, findings: list, ci: int) -> None:
 
 # --- analysis ---------------------------------------------------------------
 
-def analyze(files: list[dict], multi_folder: bool = False) -> dict:
+def analyze(files: list[dict], multi_folder: bool = False,
+            vecs: dict[str, list[float]] | None = None, threshold: float | None = None) -> dict:
     n_files = len(files)
-    clusters = cluster_questions(files)
+    clusters = cluster_questions(files, vecs, threshold)
     findings: list[dict] = []
     out_clusters = []
     for ci, c in enumerate(clusters):
@@ -511,7 +584,12 @@ document.getElementById("findings").innerHTML = R.findings.map(f =>
 
 
 def render_html(report: dict) -> str:
-    return HTML_TEMPLATE.replace("__DATA__", json.dumps(report, ensure_ascii=False))
+    # Embed JSON in <script> safely: neutralise "</script>" in answer text and the
+    # two separators that are valid JSON but illegal in JS string literals.
+    data = (json.dumps(report, ensure_ascii=False)
+            .replace("</", "<\\/")
+            .replace(" ", "\\u2028").replace(" ", "\\u2029"))
+    return HTML_TEMPLATE.replace("__DATA__", data)
 
 
 XLSX_FILLS = {OK: "DFF2DF", NOTE: "9EC5F4", WARN: "FAB219", MISSING: "EC835A", OUTLIER: "D03B3B"}
@@ -588,6 +666,11 @@ def main() -> None:
     ap.add_argument("--dir", action="append", metavar="DIR",
                      help="review every *.json in this directory; repeat --dir to merge multiple source folders into one result")
     ap.add_argument("-o", "--out", default="output/kyd_review.html")
+    ap.add_argument("--config", default="config.yaml", help="Azure config for embeddings")
+    ap.add_argument("--embed-cache", default=".kyd_embed_cache.json",
+                     help="on-disk embedding cache (reused across runs)")
+    ap.add_argument("--no-embed", action="store_true",
+                     help="skip embeddings; cluster by difflib text similarity only")
     args = ap.parse_args()
 
     dirs = args.dir or []
@@ -600,7 +683,20 @@ def main() -> None:
     if len(entries) < 2:
         ap.error("need at least 2 JSON files (pass paths or --dir, repeatable)")
 
-    report = analyze(load_files(entries), multi_folder)
+    files = load_files(entries)
+    vecs, threshold = None, None
+    if not args.no_embed:
+        try:
+            cfg = load_config(args.config)
+            sigs = [norm(q_signature(q)) for f in files for q in f["questions"]]
+            vecs = embed_signatures(sigs, cfg, Path(args.embed_cache))
+            threshold = cfg.get("drift", {}).get("cluster_threshold")
+            print(f"embeddings: {len(set(sigs))} unique signatures, semantic clustering")
+        except Exception as e:  # missing key/config/network -> lexical fallback
+            print(f"embeddings unavailable ({e}); falling back to difflib text matching")
+            vecs = None
+
+    report = analyze(files, multi_folder, vecs, threshold)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(render_html(report), encoding="utf-8")
