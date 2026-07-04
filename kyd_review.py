@@ -380,13 +380,19 @@ h1 { font-size:20px; margin:0 0 4px; } h2 { font-size:16px; margin:28px 0 8px; }
 .legend i { display:inline-block; width:14px; height:14px; border-radius:3px; vertical-align:-2px;
             margin-right:5px; border:1px solid var(--border); font-style:normal; text-align:center;
             font-size:10px; line-height:14px; color:#0b0b0b; }
-.wrap { overflow-x:auto; background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:8px; }
+.wrap { max-height:78vh; overflow:auto; background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:8px; }
 table.heat { border-collapse:separate; border-spacing:2px; }
 table.heat th { font-weight:500; color:var(--ink2); font-size:12px; }
-table.heat thead th { height:130px; vertical-align:bottom; padding:0; }
+table.heat thead th { height:130px; vertical-align:bottom; padding:0;
+   position:sticky; top:0; z-index:2; background:var(--surface); }
 table.heat thead th > div { transform:rotate(-45deg); transform-origin:bottom left;
    width:24px; white-space:nowrap; text-align:left; cursor:pointer; }
 table.heat tbody th { text-align:right; padding-right:8px; white-space:nowrap; }
+/* sticky row label; cap width so long filenames/UNC paths don't push the heat map right */
+/* ponytail: pins first column only; in multi_folder mode the folder column scrolls. per-column offsets if auditors need both pinned */
+table.heat tbody th:first-child { position:sticky; left:0; z-index:1; background:var(--surface);
+   max-width:200px; overflow:hidden; text-overflow:ellipsis; }
+table.heat thead th:first-child { left:0; z-index:3; }  /* top-left corner sticks both axes */
 td.cell { width:26px; height:22px; border-radius:4px; text-align:center; cursor:pointer;
           font-size:12px; color:#0b0b0b; border:1px solid var(--border); }
 td.cell.sel { outline:2px solid var(--ink); }
@@ -440,10 +446,10 @@ document.getElementById("legend").innerHTML =
 const heat = document.getElementById("heat");
 const fcol = R.multi_folder ? "<th></th>" : "";
 let h = "<thead><tr><th></th>" + fcol + R.clusters.map((c,i) =>
-  `<th><div onclick="showCluster(${i})" title="${esc(c.title)}">${esc(c.title.slice(0,28))}${c.title.length>28?"\\u2026":""}</div></th>`).join("") + "</tr></thead><tbody>";
+  `<th><div onclick="showCluster(${i})" title="${esc(c.title)}">${esc(c.title.slice(0,18))}${c.title.length>18?"\\u2026":""}</div></th>`).join("") + "</tr></thead><tbody>";
 R.files.forEach(fn => {
   const frow = R.multi_folder ? `<th class="muted">${esc(R.folders[fn]||"")}</th>` : "";
-  h += `<tr><th>${esc(fn)}</th>${frow}` + R.cells[fn].map((lv,ci) => {
+  h += `<tr><th title="${esc(fn)}">${esc(fn)}</th>${frow}` + R.cells[fn].map((lv,ci) => {
     if (lv < 0) return `<td class="cell na" title="not expected"></td>`;
     const t = `${fn} \\u00d7 ${R.clusters[ci].title.slice(0,60)}: ${NAME[lv]}`;
     return `<td class="cell l${lv}" id="c-${fn}-${ci}" title="${esc(t)}" onclick="showCell('${esc(fn)}',${ci})">${GLYPH[lv]}</td>`;
