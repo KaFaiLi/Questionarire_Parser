@@ -66,11 +66,31 @@ def test_heatmap_matrix_shape():
     assert all(len(v) == len(REPORT["clusters"]) for v in REPORT["cells"].values())
 
 
+def test_qvar_wording_grid():
+    # question x firm wording-divergence grid: codes 0 same / 1 formatting / 2 substantive / -1 absent
+    qv = REPORT["qvar"]
+    assert len(qv) == len(REPORT["clusters"])
+    assert all(len(row) == len(REPORT["files"]) for row in qv)
+    codes = {c for row in qv for c in row}
+    assert codes <= {-1, 0, 1, 2}
+    # a firm marked substantive (2) for a cluster must have a real wording finding there
+    warn = {(f["file"], f["cluster"]) for f in REPORT["findings"] if f["kind"] == "wording variant"}
+    for ci, row in enumerate(qv):
+        for fi, code in enumerate(row):
+            if code == 2:
+                assert (REPORT["files"][fi], ci) in warn
+
+
 def test_xlsx_export(tmp_path):
     from openpyxl import load_workbook
     p = tmp_path / "r.xlsx"
     kr.render_xlsx(REPORT, p)
     wb = load_workbook(p)
-    assert [ws.title for ws in wb] == ["Heatmap", "Findings", "Questions", "Answers"]
+    assert [ws.title for ws in wb] == ["Heatmap", "Question variance", "Findings", "Questions", "Answers"]
     assert wb["Findings"].max_row == len(REPORT["findings"]) + 1
     assert wb["Heatmap"].max_column == len(REPORT["clusters"]) + 1
+    # one variance row per canonical question, worst-first
+    assert wb["Question variance"].max_row == len(REPORT["clusters"]) + 1
+    scores = [wb["Question variance"].cell(row=r, column=8).value
+              for r in range(2, wb["Question variance"].max_row + 1)]
+    assert scores == sorted(scores, reverse=True)

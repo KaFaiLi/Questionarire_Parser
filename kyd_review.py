@@ -421,8 +421,21 @@ def analyze(files: list[dict], multi_folder: bool = False,
                 cells[fn].append(max((g["level"] for g in per_cell.get((fn, ci), [])), default=OK))
     findings.sort(key=lambda g: (-g["level"], g["cluster"], g["file"]))
     folders = {f["name"]: f.get("folder", "") for f in files}
+
+    # wording-divergence grid (question x firm): how each firm's wording of a
+    # question compares to the majority. 0 same, 1 formatting-only, 2 substantive,
+    # -1 absent. Drives the second HTML heat map.
+    kindcode = {"majority": 0, "formatting": 1, "substantive": 2}
+    qvar = []
+    for c in out_clusters:
+        fmap = {}
+        for v in c["variants"]:
+            for fn in v["files"]:
+                fmap[fn] = kindcode.get(v.get("kind"), 0)
+        qvar.append([fmap.get(fn, -1) for fn in fnames])
+
     return {"files": fnames, "clusters": out_clusters, "cells": cells, "findings": findings,
-            "folders": folders, "multi_folder": multi_folder}
+            "folders": folders, "multi_folder": multi_folder, "qvar": qvar}
 
 
 # --- report -----------------------------------------------------------------
@@ -487,6 +500,11 @@ tr.miss td { background:color-mix(in srgb, var(--serious) 14%, transparent); }
 .chip.l3{background:var(--serious);} .chip.l4{background:var(--critical);color:#fff;}
 .muted { color:var(--muted); }
 #findings li { margin:4px 0; } #findings b { cursor:pointer; text-decoration:underline; }
+button.more { margin:12px 0; padding:8px 14px; font:inherit; cursor:pointer;
+  background:var(--surface); color:var(--ink); border:1px solid var(--border); border-radius:8px; }
+td.q0 { background:color-mix(in srgb, var(--ok) 30%, var(--surface)); }
+td.q1 { background:var(--warn); }
+td.q2 { background:var(--critical); color:#fff; }
 </style>
 <h1>KYD questionnaire review</h1>
 <p class="sub">Questions matched across files by text similarity (ids not trusted). Click a cell or a column header to drill down.</p>
@@ -494,6 +512,10 @@ tr.miss td { background:color-mix(in srgb, var(--serious) 14%, transparent); }
 <div class="legend" id="legend"></div>
 <div class="wrap"><table class="heat" id="heat"></table></div>
 <div id="detail"><span class="muted">Click a heat-map cell (one firm, one question) or a column header (all firms) for details.</span></div>
+<h2>Question wording vs. majority</h2>
+<p class="sub">Each row is a canonical question, each column a questionnaire. Colour = how far that firm's wording is from the common version.</p>
+<div class="legend" id="qlegend"></div>
+<div class="wrap"><table class="heat" id="qheat"></table></div>
 <h2>All findings</h2>
 <ol id="findings"></ol>
 <script>
@@ -576,9 +598,44 @@ function select(fn, ci) {
   if (fn) { const el = document.getElementById(`c-${fn}-${ci}`); if (el) el.classList.add("sel"); }
   document.getElementById("detail").scrollIntoView({behavior:"smooth", block:"nearest"});
 }
-document.getElementById("findings").innerHTML = R.findings.map(f =>
+// wording-divergence heat map: rows = canonical questions, cols = questionnaires.
+// colour by how far each firm's wording is from the majority (green/yellow/red).
+(function(){
+  const QNAME = {0:"same as majority", 1:"formatting-only difference", 2:"substantially different wording"};
+  document.getElementById("qlegend").innerHTML =
+    [0,1,2].map(l => `<span><i class="cell q${l}" style="width:14px;height:14px"></i>${QNAME[l]}</span>`).join("") +
+    `<span><i style="background:repeating-linear-gradient(45deg,var(--surface),var(--surface) 3px,var(--grid) 3px,var(--grid) 5px)"></i>question not in this questionnaire</span>`;
+  // per-cluster firm -> that firm's actual wording, for hover
+  const wording = R.clusters.map(c => { const m={}; c.variants.forEach(v => v.files.forEach(f => m[f]=v.text)); return m; });
+  let h = "<thead><tr><th></th>" + R.files.map(fn =>
+    `<th><div title="${esc(fn)}">${esc(fn.slice(0,28))}${fn.length>28?"\\u2026":""}</div></th>`).join("") + "</tr></thead><tbody>";
+  R.clusters.forEach((c,ci) => {
+    h += `<tr><th title="${esc(c.title)}" onclick="showCluster(${ci})" style="cursor:pointer">${esc(c.title)}</th>` +
+      R.qvar[ci].map((lv,fi) => {
+        const fn = R.files[fi];
+        if (lv < 0) return `<td class="cell na" title="not in this questionnaire"></td>`;
+        const t = `${fn} \\u2014 ${QNAME[lv]}:\\n${wording[ci][fn]||""}`;
+        return `<td class="cell q${lv}" title="${esc(t)}" onclick="showCell('${esc(fn)}',${ci})"></td>`;
+      }).join("") + "</tr>";
+  });
+  document.getElementById("qheat").innerHTML = h + "</tbody>";
+})();
+
+// findings sorted most-severe first; cap the DOM at FCAP, reveal the rest on demand
+// (14k+ <li> in one list is the render bottleneck at scale, not the heat map)
+const FCAP = 200;
+const fli = f =>
   `<li><span class="chip l${f.level}">${f.kind}</span><b onclick="showCell('${esc(f.file)}',${f.cluster})">${esc(f.file)}</b>
-   \\u00d7 ${esc(R.clusters[f.cluster].title.slice(0,60))} \\u2014 ${esc(f.message)}</li>`).join("");
+   \\u00d7 ${esc(R.clusters[f.cluster].title.slice(0,60))} \\u2014 ${esc(f.message)}</li>`;
+const fbox = document.getElementById("findings");
+fbox.innerHTML = R.findings.slice(0, FCAP).map(fli).join("");
+if (R.findings.length > FCAP) {
+  const btn = document.createElement("button");
+  btn.className = "more";
+  btn.textContent = `Show all ${R.findings.length} findings (most severe ${FCAP} shown)`;
+  btn.onclick = () => { fbox.innerHTML = R.findings.map(fli).join(""); btn.remove(); };
+  fbox.after(btn);
+}
 </script>
 """
 
@@ -634,6 +691,46 @@ def render_xlsx(report: dict, path: Path) -> None:
                                 for ci, lv in enumerate(report["cells"][report["files"][r]]) if lv >= 0})
     for c in ws[1][len(lead):]:
         c.alignment = Alignment(wrap_text=True, vertical="top")
+
+    # --- per-question variance heatmap: how inconsistent is each canonical question
+    #     across firms, worst first, so the auditor knows which questions to check ---
+    from openpyxl.formatting.rule import ColorScaleRule
+    n = len(report["files"])
+
+    def qmetrics(ci, c):
+        vs = c["variants"]
+        wordings = len(vs)                                                   # distinct phrasings
+        subst = sum(len(v["files"]) for v in vs if v["kind"] == "substantive")  # firms whose wording really differs
+        fmt = sum(len(v["files"]) for v in vs if v["kind"] == "formatting")     # firms differing only cosmetically
+        fnd = [f for f in report["findings"] if f["cluster"] == ci]
+        missing = sum(1 for f in fnd if f["level"] == MISSING)
+        outliers = sum(1 for f in fnd if f["level"] == OUTLIER)
+        # ponytail: transparent weighted score; substantive drift + answer outliers weigh
+        # most, formatting is cosmetic. tune weights here if audit priorities change.
+        score = 3 * subst + 3 * outliers + 2 * missing + (wordings - 1) + 0.5 * fmt
+        return [wordings, subst, fmt, missing, outliers, round(score, 1)]
+
+    qrows = sorted(([c["title"], f'{c["coverage"]}/{n}', *qmetrics(ci, c)]
+                    for ci, c in enumerate(clusters)),
+                   key=lambda r: r[-1], reverse=True)
+    wsq = sheet("Question variance",
+                ["Question", "Coverage", "Distinct wordings", "Substantive drift",
+                 "Formatting-only", "Missing / blank", "Answer outliers", "Variance score"],
+                qrows, [45, 10, 12, 12, 12, 13, 12, 12])
+    for c in wsq[1]:
+        c.alignment = Alignment(wrap_text=True, vertical="top")
+    if qrows:
+        last = len(qrows) + 1
+        for col in "CDEFG":  # count columns: white -> red by magnitude
+            wsq.conditional_formatting.add(
+                f"{col}2:{col}{last}",
+                ColorScaleRule(start_type="num", start_value=0, start_color="FFFFFF",
+                               end_type="max", end_color="F8696B"))
+        wsq.conditional_formatting.add(  # score: green -> yellow -> red
+            f"H2:H{last}",
+            ColorScaleRule(start_type="min", start_color="63BE7B",
+                           mid_type="percentile", mid_value=50, mid_color="FFEB84",
+                           end_type="max", end_color="F8696B"))
 
     sheet("Findings", ["Severity", "Type", "File", "Question", "Detail"],
           [[LEVEL_NAMES[f["level"]], f["kind"], f["file"], titles[f["cluster"]], f["message"]]
