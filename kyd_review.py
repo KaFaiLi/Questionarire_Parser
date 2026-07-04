@@ -18,8 +18,9 @@ Answers (per canonical question, per aligned sub-question slot)
   - free-text minority answers diverging from the common wording
   - YES/NO selection contradicting the written answer
 
-Output: one self-contained HTML report (heat map of files x questions with
-click-through drill-down) plus a console summary.
+Output: one self-contained HTML report (interactive Plotly heat maps of files x
+questions, hover for detail) plus a matching xlsx and a console summary. The HTML
+renders with no server and no external requests — only an inline Plotly bundle.
 
     python kyd_review.py --dir Demo/kyd_examples -o output/kyd_review.html
     python kyd_review.py --dir //server/share/batch1 --dir //server/share/batch2 -o out.html
@@ -33,6 +34,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import hashlib
+import html
 import json
 import os
 import re
@@ -440,213 +442,149 @@ def analyze(files: list[dict], multi_folder: bool = False,
 
 # --- report -----------------------------------------------------------------
 
-HTML_TEMPLATE = """<!doctype html>
-<meta charset="utf-8">
-<title>KYD questionnaire review</title>
-<style>
-:root {
-  --surface:#fcfcfb; --page:#f9f9f7; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
-  --grid:#e1e0d9; --border:rgba(11,11,11,.10);
-  --ok:#0ca30c; --note:#9ec5f4; --warn:#fab219; --serious:#ec835a; --critical:#d03b3b;
-}
-@media (prefers-color-scheme: dark) { :root {
-  --surface:#1a1a19; --page:#0d0d0d; --ink:#ffffff; --ink2:#c3c2b7; --muted:#898781;
-  --grid:#2c2c2a; --border:rgba(255,255,255,.10); --note:#1c5cab;
-}}
-body { margin:0; padding:24px; background:var(--page); color:var(--ink);
+# severity levels 0-4 and the wording-divergence codes 0/1/2 each get a fixed colour.
+SEV_COLORS = ["#5cb85c", "#9ec5f4", "#fab219", "#ec835a", "#d03b3b"]
+SEV_NAMES = {0: "no issue", 1: "formatting-only wording",
+             2: "substantive / questionnaire-specific",
+             3: "missing (question or required answer)", 4: "answer outlier"}
+WORD_COLORS = ["#5cb85c", "#fab219", "#d03b3b"]
+WORD_NAMES = {0: "same as majority", 1: "formatting-only difference",
+              2: "substantially different wording"}
+
+PAGE_CSS = """
+:root { color-scheme: light dark; }
+body { margin:0; padding:24px; background:#f9f9f7; color:#0b0b0b;
        font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif; }
 h1 { font-size:20px; margin:0 0 4px; } h2 { font-size:16px; margin:28px 0 8px; }
-.sub { color:var(--ink2); margin:0 0 16px; }
+.sub { color:#52514e; margin:0 0 16px; }
 .tiles { display:flex; gap:12px; flex-wrap:wrap; margin:16px 0; }
-.tile { background:var(--surface); border:1px solid var(--border); border-radius:8px;
-        padding:10px 16px; min-width:110px; }
-.tile b { display:block; font-size:24px; }
-.tile span { color:var(--ink2); font-size:12px; }
-.legend { display:flex; gap:16px; flex-wrap:wrap; margin:8px 0 12px; color:var(--ink2); font-size:12px; }
-.legend i { display:inline-block; width:14px; height:14px; border-radius:3px; vertical-align:-2px;
-            margin-right:5px; border:1px solid var(--border); font-style:normal; text-align:center;
-            font-size:10px; line-height:14px; color:#0b0b0b; }
-.wrap { max-height:78vh; overflow:auto; background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:8px; }
-table.heat { border-collapse:separate; border-spacing:2px; }
-table.heat th { font-weight:500; color:var(--ink2); font-size:12px; }
-table.heat thead th { height:130px; vertical-align:bottom; padding:0;
-   position:sticky; top:0; z-index:2; background:var(--surface); }
-table.heat thead th > div { transform:rotate(-45deg); transform-origin:bottom left;
-   width:24px; white-space:nowrap; text-align:left; cursor:pointer; }
-table.heat tbody th { text-align:right; padding-right:8px; white-space:nowrap; }
-/* sticky row label; cap width so long filenames/UNC paths don't push the heat map right */
-/* ponytail: pins first column only; in multi_folder mode the folder column scrolls. per-column offsets if auditors need both pinned */
-table.heat tbody th:first-child { position:sticky; left:0; z-index:1; background:var(--surface);
-   max-width:200px; overflow:hidden; text-overflow:ellipsis; }
-table.heat thead th:first-child { left:0; z-index:3; }  /* top-left corner sticks both axes */
-td.cell { width:26px; height:22px; border-radius:4px; text-align:center; cursor:pointer;
-          font-size:12px; color:#0b0b0b; border:1px solid var(--border); }
-td.cell.sel { outline:2px solid var(--ink); }
-td.l0 { background:color-mix(in srgb, var(--ok) 18%, var(--surface)); }
-td.l1 { background:var(--note); } td.l2 { background:var(--warn); }
-td.l3 { background:var(--serious); } td.l4 { background:var(--critical); color:#fff; }
-td.na { background:repeating-linear-gradient(45deg, var(--surface), var(--surface) 3px, var(--grid) 3px, var(--grid) 5px); cursor:default; }
-#detail { background:var(--surface); border:1px solid var(--border); border-radius:8px;
-          padding:16px; margin-top:16px; }
-#detail table { border-collapse:collapse; width:100%; margin:8px 0 16px; }
-#detail th, #detail td { text-align:left; padding:4px 10px 4px 0; border-bottom:1px solid var(--grid);
-                         vertical-align:top; font-size:13px; }
-#detail th { color:var(--muted); font-weight:500; }
-tr.hot td { background:color-mix(in srgb, var(--critical) 14%, transparent); }
-tr.miss td { background:color-mix(in srgb, var(--serious) 14%, transparent); }
+.tile { background:#fff; border:1px solid rgba(11,11,11,.10); border-radius:8px; padding:10px 16px; min-width:110px; }
+.tile b { display:block; font-size:24px; } .tile span { color:#52514e; font-size:12px; }
+.plot { background:#fff; border:1px solid rgba(11,11,11,.10); border-radius:8px; padding:8px; margin-bottom:8px; }
+ol { margin:8px 0; } #findings li { margin:4px 0; }
 .chip { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; color:#0b0b0b;
-        border:1px solid var(--border); margin-right:6px; }
-.chip.l1{background:var(--note);} .chip.l2{background:var(--warn);}
-.chip.l3{background:var(--serious);} .chip.l4{background:var(--critical);color:#fff;}
-.muted { color:var(--muted); }
-#findings li { margin:4px 0; } #findings b { cursor:pointer; text-decoration:underline; }
-button.more { margin:12px 0; padding:8px 14px; font:inherit; cursor:pointer;
-  background:var(--surface); color:var(--ink); border:1px solid var(--border); border-radius:8px; }
-td.q0 { background:color-mix(in srgb, var(--ok) 30%, var(--surface)); }
-td.q1 { background:var(--warn); }
-td.q2 { background:var(--critical); color:#fff; }
-</style>
-<h1>KYD questionnaire review</h1>
-<p class="sub">Questions matched across files by text similarity (ids not trusted). Click a cell or a column header to drill down.</p>
-<div class="tiles" id="tiles"></div>
-<div class="legend" id="legend"></div>
-<div class="wrap"><table class="heat" id="heat"></table></div>
-<div id="detail"><span class="muted">Click a heat-map cell (one firm, one question) or a column header (all firms) for details.</span></div>
-<h2>Question wording vs. majority</h2>
-<p class="sub">Each row is a canonical question, each column a questionnaire. Colour = how far that firm's wording is from the common version.</p>
-<div class="legend" id="qlegend"></div>
-<div class="wrap"><table class="heat" id="qheat"></table></div>
-<h2>All findings</h2>
-<ol id="findings"></ol>
-<script>
-const R = __DATA__;
-const GLYPH = {0:"", 1:"\\u2248", 2:"\\u25B2", 3:"!", 4:"\\u2715"};
-const NAME = {0:"no issue", 1:"formatting-only wording", 2:"substantive wording / questionnaire-specific",
-              3:"missing (question or required answer)", 4:"answer outlier"};
-const esc = s => s.replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
-
-// tiles
-const counts = {1:0,2:0,3:0,4:0};
-R.findings.forEach(f => counts[f.level] !== undefined && counts[f.level]++);
-document.getElementById("tiles").innerHTML =
-  `<div class="tile"><b>${R.files.length}</b><span>questionnaires</span></div>` +
-  `<div class="tile"><b>${R.clusters.length}</b><span>canonical questions</span></div>` +
-  [4,3,2,1].map(l => `<div class="tile"><b>${counts[l]}</b><span>${NAME[l]}</span></div>`).join("");
-
-document.getElementById("legend").innerHTML =
-  [0,1,2,3,4].map(l => `<span><i class="l${l} cell" style="background:var(--${["ok","note","warn","serious","critical"][l]})">${GLYPH[l]}</i>${NAME[l]}</span>`).join("") +
-  `<span><i style="background:repeating-linear-gradient(45deg,var(--surface),var(--surface) 3px,var(--grid) 3px,var(--grid) 5px)"></i>question not expected in this file</span>`;
-
-// heat map
-const heat = document.getElementById("heat");
-const fcol = R.multi_folder ? "<th></th>" : "";
-let h = "<thead><tr><th></th>" + fcol + R.clusters.map((c,i) =>
-  `<th><div onclick="showCluster(${i})" title="${esc(c.title)}">${esc(c.title.slice(0,18))}${c.title.length>18?"\\u2026":""}</div></th>`).join("") + "</tr></thead><tbody>";
-R.files.forEach(fn => {
-  const frow = R.multi_folder ? `<th class="muted">${esc(R.folders[fn]||"")}</th>` : "";
-  h += `<tr><th title="${esc(fn)}">${esc(fn)}</th>${frow}` + R.cells[fn].map((lv,ci) => {
-    if (lv < 0) return `<td class="cell na" title="not expected"></td>`;
-    const t = `${fn} \\u00d7 ${R.clusters[ci].title.slice(0,60)}: ${NAME[lv]}`;
-    return `<td class="cell l${lv}" id="c-${fn}-${ci}" title="${esc(t)}" onclick="showCell('${esc(fn)}',${ci})">${GLYPH[lv]}</td>`;
-  }).join("") + "</tr>";
-});
-heat.innerHTML = h + "</tbody>";
-
-function findingsFor(ci, fn) {
-  return R.findings.filter(f => f.cluster === ci && (!fn || f.file === fn));
-}
-function chips(fs) {
-  return fs.length ? fs.map(f => `<div><span class="chip l${f.level}">${f.kind}</span>${!f.__one?`<b>${esc(f.file)}</b> \\u2014 `:""}${esc(f.message)}</div>`).join("")
-                   : `<span class="muted">No findings.</span>`;
-}
-function clusterDetail(ci, focusFile) {
-  const c = R.clusters[ci];
-  const flagged = new Set(findingsFor(ci).map(f => f.file));
-  let s = `<h2 style="margin-top:0">${esc(c.title)}</h2>
-    <p class="muted">Present in ${c.coverage}/${R.files.length} questionnaires${c.specific?" (questionnaire-specific)":""}.
-    Ids used: ${esc([...new Set(Object.values(c.ids))].join(", "))}</p>`;
-  s += `<h3>Question wording variants</h3><table><tr><th>Wording (question + prompts)</th><th>Type</th><th>Files</th></tr>`;
-  c.variants.forEach(v => {
-    s += `<tr><td>${esc(v.text)}</td><td>${v.kind}</td><td>${esc(v.files.join(", "))}</td></tr>`;
-  });
-  s += `</table>`;
-  c.slots.forEach(sl => {
-    s += `<h3>${esc(sl.label)}</h3><table><tr><th>File</th><th>Selection</th><th>Answer</th><th>Flags</th></tr>`;
-    sl.entries.forEach(e => {
-      const cls = e.flags.some(k => k.includes("missing")) ? "miss" : (e.flags.length ? "hot" : "");
-      const focus = e.file === focusFile ? " style='font-weight:700'" : "";
-      s += `<tr class="${cls}"><td${focus}>${esc(e.file)}</td><td>${esc(e.selection)}</td><td>${esc(e.answer)||"<span class=muted>(blank)</span>"}</td><td>${esc(e.flags.join(", "))}</td></tr>`;
-    });
-    s += `</table>`;
-  });
-  return s;
-}
-function showCluster(ci) {
-  select(null, ci);
-  document.getElementById("detail").innerHTML =
-    chips(findingsFor(ci)) + "<hr style='border:none;border-top:1px solid var(--grid)'>" + clusterDetail(ci);
-}
-function showCell(fn, ci) {
-  select(fn, ci);
-  const fs = findingsFor(ci, fn).map(f => ({...f, __one:true}));
-  document.getElementById("detail").innerHTML =
-    `<p style="margin-top:0"><b>${esc(fn)}</b> \\u00d7 <b>${esc(R.clusters[ci].title)}</b></p>` +
-    chips(fs) + "<hr style='border:none;border-top:1px solid var(--grid)'>" + clusterDetail(ci, fn);
-}
-function select(fn, ci) {
-  document.querySelectorAll("td.sel").forEach(e => e.classList.remove("sel"));
-  if (fn) { const el = document.getElementById(`c-${fn}-${ci}`); if (el) el.classList.add("sel"); }
-  document.getElementById("detail").scrollIntoView({behavior:"smooth", block:"nearest"});
-}
-// wording-divergence heat map: rows = canonical questions, cols = questionnaires.
-// colour by how far each firm's wording is from the majority (green/yellow/red).
-(function(){
-  const QNAME = {0:"same as majority", 1:"formatting-only difference", 2:"substantially different wording"};
-  document.getElementById("qlegend").innerHTML =
-    [0,1,2].map(l => `<span><i class="cell q${l}" style="width:14px;height:14px"></i>${QNAME[l]}</span>`).join("") +
-    `<span><i style="background:repeating-linear-gradient(45deg,var(--surface),var(--surface) 3px,var(--grid) 3px,var(--grid) 5px)"></i>question not in this questionnaire</span>`;
-  // per-cluster firm -> that firm's actual wording, for hover
-  const wording = R.clusters.map(c => { const m={}; c.variants.forEach(v => v.files.forEach(f => m[f]=v.text)); return m; });
-  let h = "<thead><tr><th></th>" + R.files.map(fn =>
-    `<th><div title="${esc(fn)}">${esc(fn.slice(0,28))}${fn.length>28?"\\u2026":""}</div></th>`).join("") + "</tr></thead><tbody>";
-  R.clusters.forEach((c,ci) => {
-    h += `<tr><th title="${esc(c.title)}" onclick="showCluster(${ci})" style="cursor:pointer">${esc(c.title)}</th>` +
-      R.qvar[ci].map((lv,fi) => {
-        const fn = R.files[fi];
-        if (lv < 0) return `<td class="cell na" title="not in this questionnaire"></td>`;
-        const t = `${fn} \\u2014 ${QNAME[lv]}:\\n${wording[ci][fn]||""}`;
-        return `<td class="cell q${lv}" title="${esc(t)}" onclick="showCell('${esc(fn)}',${ci})"></td>`;
-      }).join("") + "</tr>";
-  });
-  document.getElementById("qheat").innerHTML = h + "</tbody>";
-})();
-
-// findings sorted most-severe first; cap the DOM at FCAP, reveal the rest on demand
-// (14k+ <li> in one list is the render bottleneck at scale, not the heat map)
-const FCAP = 200;
-const fli = f =>
-  `<li><span class="chip l${f.level}">${f.kind}</span><b onclick="showCell('${esc(f.file)}',${f.cluster})">${esc(f.file)}</b>
-   \\u00d7 ${esc(R.clusters[f.cluster].title.slice(0,60))} \\u2014 ${esc(f.message)}</li>`;
-const fbox = document.getElementById("findings");
-fbox.innerHTML = R.findings.slice(0, FCAP).map(fli).join("");
-if (R.findings.length > FCAP) {
-  const btn = document.createElement("button");
-  btn.className = "more";
-  btn.textContent = `Show all ${R.findings.length} findings (most severe ${FCAP} shown)`;
-  btn.onclick = () => { fbox.innerHTML = R.findings.map(fli).join(""); btn.remove(); };
-  fbox.after(btn);
-}
-</script>
+        border:1px solid rgba(11,11,11,.10); margin-right:6px; }
+.chip.l1{background:#9ec5f4;} .chip.l2{background:#fab219;}
+.chip.l3{background:#ec835a;} .chip.l4{background:#d03b3b;color:#fff;}
+.muted { color:#898781; }
+details { margin:10px 0; } summary { cursor:pointer; padding:6px 0; }
 """
 
 
+def _discrete_scale(colors: list[str]) -> list[list]:
+    """Stepped plotly colorscale: integer value i -> solid colors[i]."""
+    n = len(colors)
+    cs = []
+    for i, c in enumerate(colors):
+        cs += [[i / n, c], [(i + 1) / n, c]]
+    return cs
+
+
+def _heatmap(z, x, y, text, colors, names, xlab, ylab, hovertemplate):
+    import plotly.graph_objects as go
+    n = len(colors)
+    fig = go.Figure(go.Heatmap(
+        z=z, x=x, y=y, text=text, hovertemplate=hovertemplate,
+        zmin=0, zmax=n, colorscale=_discrete_scale(colors), xgap=1, ygap=1,
+        colorbar=dict(tickvals=[i + 0.5 for i in range(n)],
+                      ticktext=[names[i] for i in range(n)], thickness=14, ticks=""),
+    ))
+    fig.update_layout(template="plotly_white", font=dict(size=11),
+                      margin=dict(l=10, r=10, t=10, b=10),
+                      height=max(420, len(y) * 16 + 180),
+                      xaxis_title=xlab, yaxis_title=ylab)
+    fig.update_xaxes(showgrid=False, tickangle=-45, side="top", automargin=True)
+    fig.update_yaxes(showgrid=False, autorange="reversed", automargin=True)
+    return fig
+
+
+def _uniq_labels(titles: list[str], width: int) -> list[str]:
+    # index-prefix keeps labels unique (plotly merges rows/cols with identical labels)
+    return [f"{i + 1}. {t[:width]}" for i, t in enumerate(titles)]
+
+
 def render_html(report: dict) -> str:
-    # Embed JSON in <script> safely: neutralise "</script>" in answer text and the
-    # two separators that are valid JSON but illegal in JS string literals.
-    data = (json.dumps(report, ensure_ascii=False)
-            .replace("</", "<\\/")
-            .replace(" ", "\\u2028").replace(" ", "\\u2029"))
-    return HTML_TEMPLATE.replace("__DATA__", data)
+    files = report["files"]
+    clusters = report["clusters"]
+    cells = report["cells"]
+    qvar = report["qvar"]
+    ctitles = [c["title"] for c in clusters]
+    esc = lambda s: html.escape(str(s))  # noqa: E731
+
+    # severity heat map: rows = questionnaires, cols = questions.
+    # hover text is just the status — the firm (y) and question (x) come from the
+    # axes, so we don't duplicate the long title into all ~files*questions cells.
+    z1, t1 = [], []
+    for fn in files:
+        zr, tr = [], []
+        for lv in cells[fn]:
+            zr.append(None if lv < 0 else lv)
+            tr.append("" if lv < 0 else SEV_NAMES[lv])
+        z1.append(zr); t1.append(tr)
+    fig1 = _heatmap(z1, _uniq_labels(ctitles, 34), files, t1, SEV_COLORS, SEV_NAMES,
+                    "canonical question", "questionnaire",
+                    "%{y}<br>%{x}<br><b>%{text}</b><extra></extra>")
+
+    # wording heat map: rows = questions, cols = questionnaires
+    wording = []
+    for c in clusters:
+        m = {}
+        for v in c["variants"]:
+            for f in v["files"]:
+                m[f] = v["text"]
+        wording.append(m)
+    # hover keeps the status + this firm's actual wording (the value-add); firm (x)
+    # and question (y) come from the axes.
+    z2, t2 = [], []
+    for ci, row in enumerate(qvar):
+        zr, tr = [], []
+        for fi, lv in enumerate(row):
+            if lv < 0:
+                zr.append(None); tr.append("")
+            else:
+                zr.append(lv)
+                w = wording[ci].get(files[fi], "")
+                tr.append(f"<b>{WORD_NAMES[lv]}</b><br>{esc(w[:140])}")
+        z2.append(zr); t2.append(tr)
+    fig2 = _heatmap(z2, files, _uniq_labels(ctitles, 44), t2, WORD_COLORS, WORD_NAMES,
+                    "questionnaire", "canonical question",
+                    "%{x}<br>%{text}<extra></extra>")
+
+    cfg = {"displaylogo": False, "responsive": True}
+    p1 = fig1.to_html(full_html=False, include_plotlyjs=True, config=cfg)
+    p2 = fig2.to_html(full_html=False, include_plotlyjs=False, config=cfg)
+
+    counts = Counter(g["level"] for g in report["findings"])
+    tiles = (f'<div class="tile"><b>{len(files)}</b><span>questionnaires</span></div>'
+             f'<div class="tile"><b>{len(clusters)}</b><span>canonical questions</span></div>'
+             + "".join(f'<div class="tile"><b>{counts.get(l, 0)}</b><span>{SEV_NAMES[l]}</span></div>'
+                       for l in (4, 3, 2, 1)))
+
+    FCAP = 200
+    items = [f'<li><span class="chip l{g["level"]}">{esc(g["kind"])}</span> '
+             f'<b>{esc(g["file"])}</b> × {esc(ctitles[g["cluster"]][:60])} '
+             f'— {esc(g["message"])}</li>' for g in report["findings"]]
+    findings = f'<ol id="findings">{"".join(items[:FCAP])}</ol>'
+    if len(items) > FCAP:
+        findings += (f'<details><summary>Show all {len(items)} findings '
+                     f'(most severe {FCAP} shown above)</summary>'
+                     f'<ol start="{FCAP + 1}">{"".join(items[FCAP:])}</ol></details>')
+
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>KYD questionnaire review</title>
+<style>{PAGE_CSS}</style></head><body>
+<h1>KYD questionnaire review</h1>
+<p class="sub">Questions matched across files (ids not trusted). Hover any cell for the firm, question and status.</p>
+<div class="tiles">{tiles}</div>
+<h2>Findings by questionnaire &times; question</h2>
+<p class="sub">Rows = questionnaires, columns = questions. Colour = worst issue found for that firm on that question.</p>
+<div class="plot">{p1}</div>
+<h2>Question wording vs. majority</h2>
+<p class="sub">Rows = questions, columns = questionnaires. Green = same wording, yellow = formatting-only, red = substantially different.</p>
+<div class="plot">{p2}</div>
+<h2>All findings</h2>
+{findings}
+</body></html>"""
 
 
 XLSX_FILLS = {OK: "DFF2DF", NOTE: "9EC5F4", WARN: "FAB219", MISSING: "EC835A", OUTLIER: "D03B3B"}
@@ -692,45 +630,21 @@ def render_xlsx(report: dict, path: Path) -> None:
     for c in ws[1][len(lead):]:
         c.alignment = Alignment(wrap_text=True, vertical="top")
 
-    # --- per-question variance heatmap: how inconsistent is each canonical question
-    #     across firms, worst first, so the auditor knows which questions to check ---
-    from openpyxl.formatting.rule import ColorScaleRule
-    n = len(report["files"])
-
-    def qmetrics(ci, c):
-        vs = c["variants"]
-        wordings = len(vs)                                                   # distinct phrasings
-        subst = sum(len(v["files"]) for v in vs if v["kind"] == "substantive")  # firms whose wording really differs
-        fmt = sum(len(v["files"]) for v in vs if v["kind"] == "formatting")     # firms differing only cosmetically
-        fnd = [f for f in report["findings"] if f["cluster"] == ci]
-        missing = sum(1 for f in fnd if f["level"] == MISSING)
-        outliers = sum(1 for f in fnd if f["level"] == OUTLIER)
-        # ponytail: transparent weighted score; substantive drift + answer outliers weigh
-        # most, formatting is cosmetic. tune weights here if audit priorities change.
-        score = 3 * subst + 3 * outliers + 2 * missing + (wordings - 1) + 0.5 * fmt
-        return [wordings, subst, fmt, missing, outliers, round(score, 1)]
-
-    qrows = sorted(([c["title"], f'{c["coverage"]}/{n}', *qmetrics(ci, c)]
-                    for ci, c in enumerate(clusters)),
-                   key=lambda r: r[-1], reverse=True)
-    wsq = sheet("Question variance",
-                ["Question", "Coverage", "Distinct wordings", "Substantive drift",
-                 "Formatting-only", "Missing / blank", "Answer outliers", "Variance score"],
-                qrows, [45, 10, 12, 12, 12, 13, 12, 12])
-    for c in wsq[1]:
-        c.alignment = Alignment(wrap_text=True, vertical="top")
-    if qrows:
-        last = len(qrows) + 1
-        for col in "CDEFG":  # count columns: white -> red by magnitude
-            wsq.conditional_formatting.add(
-                f"{col}2:{col}{last}",
-                ColorScaleRule(start_type="num", start_value=0, start_color="FFFFFF",
-                               end_type="max", end_color="F8696B"))
-        wsq.conditional_formatting.add(  # score: green -> yellow -> red
-            f"H2:H{last}",
-            ColorScaleRule(start_type="min", start_color="63BE7B",
-                           mid_type="percentile", mid_value=50, mid_color="FFEB84",
-                           end_type="max", end_color="F8696B"))
+    # --- wording heat map (question x firm), mirrors the HTML's second heat map:
+    #     green = same as majority, yellow = formatting-only, red = substantially
+    #     different, grey = question absent from that questionnaire ---
+    WORD_FILLS = {0: "5CB85C", 1: "FAB219", 2: "D03B3B"}
+    ABSENT_FILL = "ECECEC"
+    qvar = report["qvar"]
+    fnames = report["files"]
+    wsw = sheet("Question wording", ["Question"] + fnames,
+                [[titles[ci]] + [""] * len(fnames) for ci in range(len(clusters))],
+                [45] + [4] * len(fnames),
+                fills=lambda r: {fi + 2: WORD_FILLS.get(code, ABSENT_FILL)
+                                 for fi, code in enumerate(qvar[r])})
+    for c in wsw[1][1:]:  # rotate firm headers like the HTML column labels
+        c.alignment = Alignment(textRotation=90, vertical="bottom")
+    wsw.row_dimensions[1].height = 120
 
     sheet("Findings", ["Severity", "Type", "File", "Question", "Detail"],
           [[LEVEL_NAMES[f["level"]], f["kind"], f["file"], titles[f["cluster"]], f["message"]]

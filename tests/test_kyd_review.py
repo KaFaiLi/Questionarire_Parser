@@ -86,11 +86,16 @@ def test_xlsx_export(tmp_path):
     p = tmp_path / "r.xlsx"
     kr.render_xlsx(REPORT, p)
     wb = load_workbook(p)
-    assert [ws.title for ws in wb] == ["Heatmap", "Question variance", "Findings", "Questions", "Answers"]
+    assert [ws.title for ws in wb] == ["Heatmap", "Question wording", "Findings", "Questions", "Answers"]
     assert wb["Findings"].max_row == len(REPORT["findings"]) + 1
     assert wb["Heatmap"].max_column == len(REPORT["clusters"]) + 1
-    # one variance row per canonical question, worst-first
-    assert wb["Question variance"].max_row == len(REPORT["clusters"]) + 1
-    scores = [wb["Question variance"].cell(row=r, column=8).value
-              for r in range(2, wb["Question variance"].max_row + 1)]
-    assert scores == sorted(scores, reverse=True)
+    # wording grid: one row per question, one column per firm (+ the Question column)
+    wsw = wb["Question wording"]
+    assert wsw.max_row == len(REPORT["clusters"]) + 1
+    assert wsw.max_column == len(REPORT["files"]) + 1
+    # a substantive cell (qvar==2) must be filled red
+    for ci, row in enumerate(REPORT["qvar"]):
+        for fi, code in enumerate(row):
+            if code == 2:
+                assert wsw.cell(row=ci + 2, column=fi + 2).fill.start_color.rgb.endswith("D03B3B")
+                return
