@@ -50,9 +50,37 @@ LEVEL_NAMES = {OK: "ok", NOTE: "formatting", WARN: "wording / specific",
 SIM_QUESTION = 0.60   # min similarity to treat two questions as the same
 SIM_SLOT = 0.70       # min similarity to align two sub-question slots
 SIM_TEXT_GROUP = 0.75 # min similarity to group two free-text answers
-SPECIFIC_SHARE = 0.25 # present in <= this share of files => questionnaire-specific
+
+# Question matching profiles. Tolerant mode is for parser/OCR-heavy inputs. It
+# keeps the full q_signature() for initial clustering, including its
+# sub-question fallback for records with no top-level question text, then uses
+# high-confidence parent evidence to reconnect parser fragments.
+QUESTION_MATCHING = {
+    "standard": {"embedding_threshold": 0.84, "slot_similarity": SIM_SLOT,
+                 "parent_presence": False},
+    "tolerant": {"embedding_threshold": 0.78, "slot_similarity": 0.60,
+                 "parent_presence": True},
+}
+PARENT_PRESENCE_DEFAULTS = {
+    "allow_top_level_evidence": True,
+    "top_level_similarity": 0.78,
+    "allow_subquestion_evidence": False,
+    "slot_similarity": 0.78,
+    "minimum_distinctive_slot_matches": 1,
+    "uniqueness_margin": 0.05,
+    "ignore_subquestion_wording_drift": False,
+}
 MINORITY_SHARE = 0.25 # answer value held by <= this share => outlier candidate
-REQUIRED_SHARE = 0.70 # answered in >= this share => blanks are "missing"
+
+# Focused-review defaults.  These deliberately require broad peer agreement
+# before turning an inconsistency into a finding.  They can be overridden by
+# the ``review`` section in config.yaml.
+SPECIFIC_SHARE = 0.15           # <= this share: questionnaire-specific (informational)
+COMMON_QUESTION_SHARE = 0.85    # >= this share: absence is a missing question
+WORDING_MIN_COVERAGE = 0.80     # wording differences need this question coverage
+WORDING_VARIANT_MAX_SHARE = 0.25  # and must be a small minority variant
+REQUIRED_SHARE = 0.85           # peers must answer at this rate before blank is missing
+NA_SUBSTANTIVE_SHARE = 0.85     # peers must give text at this rate before N/A is challenged
 
 
 def norm(s: str) -> str:
@@ -87,6 +115,67 @@ def ratio(a: str, b: str) -> float:
 def load_config(path: str = "config.yaml") -> dict:
     import yaml
     return yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+
+
+def question_matching_settings(cfg: dict) -> dict:
+    """Resolve the question matching profile and validate its overrides.
+
+    ``drift.cluster_threshold`` remains the standard-mode compatibility
+    setting.  In tolerant mode, ``question_matching.embedding_threshold`` and
+    ``question_matching.slot_similarity`` may override the profile defaults.
+    """
+    settings = cfg.get("question_matching", {}) or {}
+    mode = settings.get("mode", "standard")
+    if mode not in QUESTION_MATCHING:
+        choices = ", ".join(sorted(QUESTION_MATCHING))
+        raise ValueError(f"question_matching.mode must be one of: {choices}")
+    defaults = QUESTION_MATCHING[mode]
+
+    def threshold(name: str, default: float) -> float:
+        value = float(settings.get(name, default))
+        if not 0 < value <= 1:
+            raise ValueError(f"question_matching.{name} must be greater than 0 and at most 1")
+        return value
+
+    standard_embedding = cfg.get("drift", {}).get("cluster_threshold", defaults["embedding_threshold"])
+    embedding_default = standard_embedding if mode == "standard" else defaults["embedding_threshold"]
+    raw_parent = settings.get("parent_presence", {}) or {}
+    if not isinstance(raw_parent, dict):
+        raise ValueError("question_matching.parent_presence must be a mapping")
+
+    def flag(name: str, default: bool) -> bool:
+        value = raw_parent.get(name, default)
+        if not isinstance(value, bool):
+            raise ValueError(f"question_matching.parent_presence.{name} must be true or false")
+        return value
+
+    def parent_threshold(name: str, default: float) -> float:
+        value = float(raw_parent.get(name, default))
+        if not 0 < value <= 1:
+            raise ValueError(f"question_matching.parent_presence.{name} must be greater than 0 and at most 1")
+        return value
+
+    enabled = flag("allow_subquestion_evidence", defaults["parent_presence"])
+    parent_presence = {
+        "allow_top_level_evidence": flag("allow_top_level_evidence", True),
+        "top_level_similarity": parent_threshold("top_level_similarity", PARENT_PRESENCE_DEFAULTS["top_level_similarity"]),
+        "allow_subquestion_evidence": enabled,
+        # This is deliberately higher than tolerant slot alignment: a slot can
+        # be loosely aligned for answer review but must be a strong signal to
+        # prove that a parent question exists.
+        "slot_similarity": parent_threshold("slot_similarity", PARENT_PRESENCE_DEFAULTS["slot_similarity"]),
+        "minimum_distinctive_slot_matches": int(raw_parent.get(
+            "minimum_distinctive_slot_matches", PARENT_PRESENCE_DEFAULTS["minimum_distinctive_slot_matches"])),
+        "uniqueness_margin": parent_threshold("uniqueness_margin", PARENT_PRESENCE_DEFAULTS["uniqueness_margin"]),
+        "ignore_subquestion_wording_drift": flag("ignore_subquestion_wording_drift", enabled),
+    }
+    if parent_presence["minimum_distinctive_slot_matches"] < 1:
+        raise ValueError("question_matching.parent_presence.minimum_distinctive_slot_matches must be at least 1")
+
+    return {"mode": mode,
+            "embedding_threshold": threshold("embedding_threshold", embedding_default),
+            "slot_similarity": threshold("slot_similarity", defaults["slot_similarity"]),
+            "parent_presence": parent_presence}
 
 
 def _azure_key(az: dict) -> str | None:
@@ -239,16 +328,168 @@ def cluster_title(c: dict) -> str:
     return Counter(texts).most_common(1)[0][0] if texts else "(untitled)"
 
 
+_GENERIC_SLOT_WORDS = {
+    "a", "an", "and", "answer", "applicable", "details", "for", "if", "information", "n",
+    "na", "no", "not", "of", "or", "please", "provide", "response", "the", "to", "yes",
+}
+
+
+def _slot_raw(s: dict) -> str:
+    return (s.get("option_label", "") + " " + s.get("prompt", "")).strip()
+
+
+def _distinctive_text(raw: str, minimum_length: int) -> bool:
+    """Whether text has enough non-boilerplate content to identify a parent."""
+    key = norm(raw)
+    tokens = [t for t in key.split() if t not in _GENERIC_SLOT_WORDS]
+    return len(key) >= minimum_length and len(tokens) >= 2
+
+
+def _distinctive_slot(raw: str) -> bool:
+    """Whether a child prompt is sufficiently specific to identify a parent.
+
+    Generic fragments ("yes/no", "please provide details") are useful for
+    alignment inside a known question but must never prove a parent question is
+    present: they commonly appear throughout a questionnaire.
+    """
+    return _distinctive_text(raw, 16)
+
+
+def _best_slot_similarity(raw: str, target: dict) -> float:
+    """Best lexical child-slot match, preserving the enumeration guard."""
+    key, mark = norm(raw), _enum_marker(raw)
+    scores = []
+    for q in target["members"].values():
+        for s in q.get("sub_questions", []):
+            other = _slot_raw(s)
+            if mark != _enum_marker(other):
+                continue
+            scores.append(ratio(key, norm(other)))
+    return max(scores, default=0.0)
+
+
+def _best_top_level_similarity(raw: str, target: dict) -> float:
+    key = norm(raw)
+    return max((ratio(key, norm(q.get("question", ""))) for q in target["members"].values()
+                if norm(q.get("question", ""))), default=0.0)
+
+
+def _add_unambiguous_evidence(raw: str, source_file: str, source_cluster: dict,
+                              clusters: list[dict], threshold: float, margin: float,
+                              scorer, evidence: dict[int, list[float]], targets: dict[int, dict]) -> None:
+    """Add evidence for a uniquely best parent cluster, if one exists."""
+    scores = []
+    for target in clusters:
+        if (target is source_cluster or source_file in target["members"]
+                or len(target["members"]) <= len(source_cluster["members"])):
+            continue
+        score = scorer(raw, target)
+        if score >= threshold:
+            scores.append((score, target))
+    scores.sort(key=lambda item: item[0], reverse=True)
+    if not scores:
+        return
+    best_score, best_target = scores[0]
+    second_score = scores[1][0] if len(scores) > 1 else 0.0
+    if second_score and best_score - second_score < margin:
+        return
+    key = id(best_target)
+    evidence.setdefault(key, []).append(best_score)
+    targets[key] = best_target
+
+
+def _parent_target_for_question(source: dict, source_file: str, source_cluster: dict,
+                                clusters: list[dict], presence: dict) -> dict | None:
+    """Find one unambiguous parent cluster from heading or child-slot evidence."""
+    evidence: dict[int, list[float]] = {}
+    targets: dict[int, dict] = {}
+    title = source.get("question", "")
+    if presence["allow_top_level_evidence"] and _distinctive_text(title, 8):
+        _add_unambiguous_evidence(title, source_file, source_cluster, clusters,
+                                  presence["top_level_similarity"], presence["uniqueness_margin"],
+                                  _best_top_level_similarity, evidence, targets)
+    title_targets = set(evidence)
+    for s in source.get("sub_questions", []):
+        raw = _slot_raw(s)
+        if not _distinctive_slot(raw):
+            continue
+        _add_unambiguous_evidence(raw, source_file, source_cluster, clusters,
+                                  presence["slot_similarity"], presence["uniqueness_margin"],
+                                  _best_slot_similarity, evidence, targets)
+
+    candidates = [(len(scores), sum(scores), targets[key])
+                  for key, scores in evidence.items()
+                  if (len(scores) >= presence["minimum_distinctive_slot_matches"]
+                      or key in title_targets)]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    # Two targets with the same evidence strength leave parent presence
+    # uncertain.  Suppress the merge rather than guessing.
+    if len(candidates) > 1 and candidates[0][:2] == candidates[1][:2]:
+        return None
+    return candidates[0][2]
+
+
+def merge_parent_evidence_clusters(clusters: list[dict], presence: dict) -> list[dict]:
+    """Merge parser-fragmented clusters when all their members prove one parent.
+
+    Initial clustering remains based on the full question/sub-question
+    signature. This second pass only joins a smaller cluster to a larger parent
+    cluster with strong, unique heading or child-slot evidence; it therefore
+    turns partial child parsing into a parent-presence decision rather than a
+    missing parent-question finding.
+    """
+    if not presence["allow_subquestion_evidence"]:
+        return clusters
+    while True:
+        merged = False
+        for source in sorted(clusters, key=lambda c: len(c["members"])):
+            targets = [_parent_target_for_question(q, fname, source, clusters, presence)
+                       for fname, q in source["members"].items()]
+            if not targets or any(t is None for t in targets):
+                continue
+            target = targets[0]
+            if any(t is not target for t in targets[1:]):
+                continue
+            # The target cannot already contain one of the source files; this
+            # maintains the one-question-per-file invariant of a cluster.
+            if any(fname in target["members"] for fname in source["members"]):
+                continue
+            target["members"].update(source["members"])
+            target["positions"].extend(source["positions"])
+            if "vsum" in target and "vsum" in source:
+                target["vsum"] = target["vsum"] + source["vsum"]
+            clusters.remove(source)
+            merged = True
+            break
+        if not merged:
+            break
+    clusters.sort(key=lambda c: statistics.median(c["positions"]))
+    return clusters
+
+
 # --- checks ------------------------------------------------------------------
 
-def check_variants(c: dict, findings: list, ci: int) -> list[dict]:
+def check_variants(c: dict, findings: list, ci: int, n_files: int,
+                   min_coverage: float, max_variant_share: float,
+                   top_level_only: bool = False) -> list[dict]:
     """Classify wording variants of one canonical question."""
     by_raw: dict[str, list[str]] = {}
+    unavailable = []
     for fname, q in c["members"].items():
-        by_raw.setdefault(q_signature(q), []).append(fname)
+        raw = q.get("question", "") if top_level_only else q_signature(q)
+        if top_level_only and not norm(raw):
+            unavailable.append(fname)
+        else:
+            by_raw.setdefault(raw, []).append(fname)
+    if not by_raw:
+        return [{"text": "", "files": list(c["members"]), "kind": "majority"}]
     variants = [{"text": raw, "files": fs} for raw, fs in by_raw.items()]
     if len(variants) == 1:
         variants[0]["kind"] = "majority"
+        if unavailable:
+            variants.append({"text": "", "files": unavailable, "kind": "unavailable"})
         return variants
     majority = max(variants, key=lambda v: len(v["files"]))
     for v in variants:
@@ -261,9 +502,18 @@ def check_variants(c: dict, findings: list, ci: int) -> list[dict]:
                                      message="Question wording differs only in spacing/case from the common version."))
         else:
             v["kind"] = "substantive"
-            for fn in v["files"]:
-                findings.append(dict(file=fn, cluster=ci, level=WARN, kind="wording variant",
-                                     message=f"Question wording differs substantively from the common version: “{v['text'][:120]}”"))
+            # A genuine wording issue needs both a widely-used question and a
+            # clearly exceptional variant.  Otherwise it is useful context in
+            # the wording sheet, but not a review finding.
+            if (len(c["members"]) / n_files >= min_coverage
+                    and len(v["files"]) / n_files <= max_variant_share
+                    and len(v["files"]) < len(majority["files"])):
+                for fn in v["files"]:
+                    findings.append(dict(file=fn, cluster=ci, level=WARN, kind="wording variant",
+                                         message=f"Question wording differs substantively from the common version: “{v['text'][:120]}”"))
+    if unavailable:
+        # A blank top-level heading is a parsing limitation, not wording drift.
+        variants.append({"text": "", "files": unavailable, "kind": "unavailable"})
     return variants
 
 
@@ -273,7 +523,7 @@ def _enum_marker(s: str) -> str:
     return m.group(1) if m else ""
 
 
-def align_slots(c: dict) -> list[dict]:
+def align_slots(c: dict, threshold: float = SIM_SLOT) -> list[dict]:
     """Align sub-questions across files by option label + prompt similarity.
 
     Slots with different enumeration markers (a) vs b)) are never merged —
@@ -285,7 +535,7 @@ def align_slots(c: dict) -> list[dict]:
             raw = (s.get("option_label", "") + " " + s.get("prompt", "")).strip()
             key, mark = norm(raw), _enum_marker(raw)
             hit = next((sl for sl in slots if sl["mark"] == mark
-                        and (sl["key"] == key or ratio(key, sl["key"]) >= SIM_SLOT)), None)
+                        and (sl["key"] == key or ratio(key, sl["key"]) >= threshold)), None)
             if hit is None:
                 label = (s.get("option_label") or s.get("prompt") or "answer").strip()
                 hit = {"key": key, "mark": mark, "label": label, "entries": []}
@@ -305,7 +555,8 @@ def _flag(entry: dict, findings: list, ci: int, level: int, kind: str, message: 
     findings.append(dict(file=entry["file"], cluster=ci, level=level, kind=kind, message=message))
 
 
-def check_answers(slot: dict, findings: list, ci: int) -> None:
+def check_answers(slot: dict, findings: list, ci: int,
+                  required_share: float, na_substantive_share: float) -> None:
     entries = slot["entries"]
     n = len(entries)
     if n < 3:
@@ -335,16 +586,16 @@ def check_answers(slot: dict, findings: list, ci: int) -> None:
     # blanks vs declared N/A vs substantive answers
     answered = [e for e in entries if answer_class(e["answer"]) != "blank"]
     filled = [e for e in entries if answer_class(e["answer"]) == "text"]
-    if answered and len(answered) / n >= REQUIRED_SHARE:
+    if answered and len(answered) / n >= required_share:
         for e in entries:
             if answer_class(e["answer"]) == "blank" and not e["selection"].strip():
                 _flag(e, findings, ci, MISSING, "missing answer",
                       f"Answer left blank while {len(answered)}/{n} firms answered.")
     # declared N/A while peers answered substantively => the assertion needs challenging
-    if answered and len(filled) / len(answered) >= REQUIRED_SHARE:
+    if answered and len(filled) / len(answered) >= na_substantive_share:
         for e in answered:
             if answer_class(e["answer"]) == "na":
-                _flag(e, findings, ci, MISSING, "declared N/A",
+                _flag(e, findings, ci, WARN, "declared N/A",
                       f"Firm answered “{e['answer']}” while {len(filled)}/{len(answered)} peers gave a substantive answer — the not-applicable claim should be challenged.")
     if len(filled) < 5:
         return
@@ -381,31 +632,53 @@ def check_answers(slot: dict, findings: list, ci: int) -> None:
 # --- analysis ---------------------------------------------------------------
 
 def analyze(files: list[dict], multi_folder: bool = False,
-            vecs: dict[str, list[float]] | None = None, threshold: float | None = None) -> dict:
+            vecs: dict[str, list[float]] | None = None, threshold: float | None = None,
+            review: dict | None = None, slot_threshold: float = SIM_SLOT,
+            parent_presence: dict | None = None) -> dict:
+    """Analyze questionnaires using optional focused-review share thresholds."""
+    review = review or {}
+    parent_presence = {**PARENT_PRESENCE_DEFAULTS, **(parent_presence or {})}
+
+    def share(name: str, default: float) -> float:
+        value = float(review.get(name, default))
+        if not 0 < value <= 1:
+            raise ValueError(f"review.{name} must be greater than 0 and at most 1")
+        return value
+
+    specific_share = share("specific_question_share", SPECIFIC_SHARE)
+    common_question_share = share("common_question_share", COMMON_QUESTION_SHARE)
+    wording_min_coverage = share("wording_min_coverage", WORDING_MIN_COVERAGE)
+    wording_variant_max_share = share("wording_variant_max_share", WORDING_VARIANT_MAX_SHARE)
+    required_share = share("required_answer_share", REQUIRED_SHARE)
+    na_substantive_share = share("na_substantive_share", NA_SUBSTANTIVE_SHARE)
     n_files = len(files)
     clusters = cluster_questions(files, vecs, threshold)
+    clusters = merge_parent_evidence_clusters(clusters, parent_presence)
     findings: list[dict] = []
     out_clusters = []
     for ci, c in enumerate(clusters):
         coverage = len(c["members"])
-        specific = coverage / n_files <= SPECIFIC_SHARE
+        coverage_share = coverage / n_files
+        specific = coverage_share <= specific_share
+        expected = coverage_share >= common_question_share
         if specific:
             for fn in c["members"]:
-                findings.append(dict(file=fn, cluster=ci, level=WARN, kind="questionnaire-specific",
+                findings.append(dict(file=fn, cluster=ci, level=NOTE, kind="questionnaire-specific",
                                      message=f"Question appears in only {coverage}/{n_files} questionnaires."))
-        else:
+        elif expected:
             for f in files:
                 if f["name"] not in c["members"]:
                     findings.append(dict(file=f["name"], cluster=ci, level=MISSING, kind="question missing",
                                          message=f"Question present in {coverage}/{n_files} questionnaires but absent here."))
-        variants = check_variants(c, findings, ci)
-        slots = align_slots(c)
+        variants = check_variants(c, findings, ci, n_files, wording_min_coverage, wording_variant_max_share,
+                                  parent_presence["ignore_subquestion_wording_drift"])
+        slots = align_slots(c, slot_threshold)
         for slot in slots:
-            check_answers(slot, findings, ci)
+            check_answers(slot, findings, ci, required_share, na_substantive_share)
         out_clusters.append({
             "title": cluster_title(c),
             "ids": {fn: q["question_id"] for fn, q in c["members"].items()},
-            "coverage": coverage, "specific": specific,
+            "coverage": coverage, "specific": specific, "expected": expected,
             "variants": variants,
             "slots": [{"label": s["label"], "entries": s["entries"]} for s in slots],
         })
@@ -417,7 +690,7 @@ def analyze(files: list[dict], multi_folder: bool = False,
         per_cell[(g["file"], g["cluster"])].append(g)
     for fn in fnames:
         for ci, c in enumerate(out_clusters):
-            if fn not in c["ids"] and c["specific"]:
+            if fn not in c["ids"] and not c["expected"]:
                 cells[fn].append(-1)  # not expected here
             else:
                 cells[fn].append(max((g["level"] for g in per_cell.get((fn, ci), [])), default=OK))
@@ -713,19 +986,30 @@ def main() -> None:
         ap.error("need at least 2 JSON files (pass paths or --dir, repeatable)")
 
     files = load_files(entries)
-    vecs, threshold = None, None
+    vecs, threshold, cfg, config_error = None, None, {}, None
+    try:
+        cfg = load_config(args.config) or {}
+    except Exception as e:
+        config_error = e
+    try:
+        matching = question_matching_settings(cfg)
+    except Exception as e:
+        ap.error(str(e))
     if not args.no_embed:
         try:
-            cfg = load_config(args.config)
+            if config_error:
+                raise config_error
             sigs = [norm(q_signature(q)) for f in files for q in f["questions"]]
             vecs = embed_signatures(sigs, cfg, Path(args.embed_cache))
-            threshold = cfg.get("drift", {}).get("cluster_threshold")
-            print(f"embeddings: {len(set(sigs))} unique signatures, semantic clustering")
+            threshold = matching["embedding_threshold"]
+            print(f"embeddings: {len(set(sigs))} unique signatures, semantic clustering "
+                  f"({matching['mode']} profile, threshold {threshold:g})")
         except Exception as e:  # missing key/config/network -> lexical fallback
             print(f"embeddings unavailable ({e}); falling back to difflib text matching")
             vecs = None
 
-    report = analyze(files, multi_folder, vecs, threshold)
+    report = analyze(files, multi_folder, vecs, threshold, cfg.get("review", {}),
+                     matching["slot_similarity"], matching["parent_presence"])
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(render_html(report), encoding="utf-8")
