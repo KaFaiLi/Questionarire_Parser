@@ -52,8 +52,8 @@ from pathlib import Path
 # classification, embedding cache, long-path shim, numeric parse, and both
 # renderers. Only the reader, the free-text answer engine, the Summary sheet and
 # the (supplementary) LLM anomaly layer are new here. kyd_review is left intact.
-import kyd_review as kyd
-from kyd_review import (
+import kyd_review_compat as kyd
+from kyd_review_compat import (
     OK, NOTE, WARN, MISSING, OUTLIER,
     SPECIFIC_SHARE, REQUIRED_SHARE, MINORITY_SHARE,
     norm, ratio, canon, answer_class, _num, q_signature,
