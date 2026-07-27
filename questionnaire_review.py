@@ -55,14 +55,28 @@ from pathlib import Path
 import kyd_review_compat as kyd
 from kyd_review_compat import (
     OK, NOTE, WARN, MISSING, OUTLIER,
-    SPECIFIC_SHARE, REQUIRED_SHARE, MINORITY_SHARE,
+    MINORITY_SHARE,
     norm, ratio, canon, answer_class, _num, q_signature,
-    cluster_questions, cluster_title, check_variants, _flag,
+    cluster_questions, cluster_title, _flag,
     embed_signatures, load_config, _winlong, render_html, render_xlsx,
 )
+from kyd_review import check_variants as check_question_variants
+from kyd_review import question_matching_settings
+
+# Long-format rows have no child slots, so KYD's parser-fragment parent-evidence
+# pass is intentionally inapplicable; tolerant top-level matching is shared.
 
 SHEET = "Questionnaire_Long"
 NEEDED = ("source_file", "section", "question_id", "question", "answer")
+
+# Keep the review signal focused on broad consensus, matching kyd_review.py.
+# All values are configurable under ``review`` in config.yaml.
+SPECIFIC_SHARE = 0.15
+COMMON_QUESTION_SHARE = 0.85
+WORDING_MIN_COVERAGE = 0.80
+WORDING_VARIANT_MAX_SHARE = 0.25
+REQUIRED_SHARE = 0.85
+NA_SUBSTANTIVE_SHARE = 0.85
 
 
 # --- reading long-format xlsx ------------------------------------------------
@@ -155,8 +169,29 @@ def _answer_sim(a: str, b: str, avecs: dict | None) -> float:
     return ratio(canon(a), canon(b))
 
 
+def review_settings(review: dict | None) -> dict[str, float]:
+    """Resolve the broad-consensus thresholds shared with the KYD review."""
+    review = review or {}
+
+    def share(name: str, default: float) -> float:
+        value = float(review.get(name, default))
+        if not 0 < value <= 1:
+            raise ValueError(f"review.{name} must be greater than 0 and at most 1")
+        return value
+
+    return {
+        "specific_question_share": share("specific_question_share", SPECIFIC_SHARE),
+        "common_question_share": share("common_question_share", COMMON_QUESTION_SHARE),
+        "wording_min_coverage": share("wording_min_coverage", WORDING_MIN_COVERAGE),
+        "wording_variant_max_share": share("wording_variant_max_share", WORDING_VARIANT_MAX_SHARE),
+        "required_answer_share": share("required_answer_share", REQUIRED_SHARE),
+        "na_substantive_share": share("na_substantive_share", NA_SUBSTANTIVE_SHARE),
+    }
+
+
 def check_answers(entries: list[dict], findings: list, ci: int,
-                  avecs: dict | None, cos_thr: float) -> None:
+                  avecs: dict | None, cos_thr: float, required_share: float,
+                  na_substantive_share: float) -> None:
     """Blank / declared-N/A / numeric-outlier / free-text-outlier on one question."""
     n = len(entries)
     if n < 3:
@@ -165,15 +200,15 @@ def check_answers(entries: list[dict], findings: list, ci: int,
     answered = [e for e in entries if cls(e) != "blank"]
     filled = [e for e in entries if cls(e) == "text"]  # substantive (incl. numbers)
 
-    if answered and len(answered) / n >= REQUIRED_SHARE:
+    if answered and len(answered) / n >= required_share:
         for e in entries:
             if cls(e) == "blank":
                 _flag(e, findings, ci, MISSING, "missing answer",
                       f"Answer left blank while {len(answered)}/{n} firms answered.")
-    if answered and len(filled) / len(answered) >= REQUIRED_SHARE:
+    if answered and len(filled) / len(answered) >= na_substantive_share:
         for e in answered:
             if cls(e) == "na":
-                _flag(e, findings, ci, MISSING, "declared N/A",
+                _flag(e, findings, ci, WARN, "declared N/A",
                       f"Firm answered “{e['answer']}” while {len(filled)}/{len(answered)} peers gave a "
                       f"substantive answer — the not-applicable claim should be challenged.")
     if len(filled) < 5:
@@ -214,31 +249,38 @@ def check_answers(entries: list[dict], findings: list, ci: int,
 # --- analysis (builds the same report dict kyd_review's renderers consume) ----
 
 def analyze(files: list[dict], multi_folder: bool, qvecs, avecs,
-            threshold, cos_thr: float) -> dict:
+            threshold, cos_thr: float, review: dict | None = None) -> dict:
+    settings = review_settings(review)
     n_files = len(files)
     clusters = cluster_questions(files, qvecs, threshold)
     findings: list[dict] = []
     out_clusters = []
     for ci, c in enumerate(clusters):
         coverage = len(c["members"])
-        specific = coverage / n_files <= SPECIFIC_SHARE
+        coverage_share = coverage / n_files
+        specific = coverage_share <= settings["specific_question_share"]
+        expected = coverage_share >= settings["common_question_share"]
         if specific:
             for fn in c["members"]:
-                findings.append(dict(file=fn, cluster=ci, level=WARN, kind="questionnaire-specific",
+                findings.append(dict(file=fn, cluster=ci, level=NOTE, kind="questionnaire-specific",
                                      message=f"Question appears in only {coverage}/{n_files} questionnaires."))
-        else:
+        elif expected:
             for f in files:
                 if f["name"] not in c["members"]:
                     findings.append(dict(file=f["name"], cluster=ci, level=MISSING, kind="question missing",
                                          message=f"Question present in {coverage}/{n_files} questionnaires but absent here."))
-        variants = check_variants(c, findings, ci)
+        variants = check_question_variants(
+            c, findings, ci, n_files, settings["wording_min_coverage"],
+            settings["wording_variant_max_share"], top_level_only=True)
         entries = [{"file": fn, "selection": "", "answer": q.get("answer", ""), "flags": []}
                    for fn, q in c["members"].items()]
-        check_answers(entries, findings, ci, avecs, cos_thr)
+        check_answers(entries, findings, ci, avecs, cos_thr,
+                      settings["required_answer_share"], settings["na_substantive_share"])
         out_clusters.append({
             "title": cluster_title(c),
             "ids": {fn: q["question_id"] for fn, q in c["members"].items()},
-            "coverage": coverage, "specific": specific, "variants": variants,
+            "coverage": coverage, "specific": specific, "expected": expected,
+            "variants": variants,
             "slots": [{"label": "answer", "entries": entries}],
         })
 
@@ -250,7 +292,7 @@ def analyze(files: list[dict], multi_folder: bool, qvecs, avecs,
     cells = {fn: [] for fn in fnames}
     for fn in fnames:
         for ci, c in enumerate(out_clusters):
-            if fn not in c["ids"] and c["specific"]:
+            if fn not in c["ids"] and not c["expected"]:
                 cells[fn].append(-1)
             else:
                 cells[fn].append(max((g["level"] for g in per_cell.get((fn, ci), [])), default=OK))
@@ -539,12 +581,16 @@ def main() -> None:
         cfg = load_config(args.config)
     except Exception as e:  # noqa: BLE001
         print(f"config unavailable ({e}); embeddings and LLM disabled")
+    try:
+        matching = question_matching_settings(cfg or {})
+    except ValueError as e:
+        ap.error(str(e))
 
     qvecs = avecs = threshold = None
     cos_thr = 0.84
     if cfg and not args.no_embed:
         try:
-            threshold = cfg.get("drift", {}).get("cluster_threshold")
+            threshold = matching["embedding_threshold"]
             cos_thr = cfg.get("outliers", {}).get("answer_threshold", cos_thr)
             qsigs = {norm(q_signature(q)) for f in files for q in f["questions"]}
             # embed only real free text — pure numbers are judged numerically, not embedded
@@ -553,13 +599,15 @@ def main() -> None:
             allvecs = embed_signatures(sorted(qsigs | atexts), cfg, Path(args.embed_cache))
             qvecs = {s: allvecs[s] for s in qsigs}
             avecs = {s: allvecs[s] for s in atexts}
-            print(f"embeddings: {len(qsigs)} questions, {len(atexts)} free-text answers")
+            print(f"embeddings: {len(qsigs)} questions, {len(atexts)} free-text answers "
+                  f"({matching['mode']} profile, threshold {threshold:g})")
         except Exception as e:  # noqa: BLE001 — any embedding failure -> lexical fallback
             print(f"embeddings unavailable ({e}); falling back to difflib")
             qvecs = avecs = None
             cos_thr = 0.75
 
-    report = analyze(files, multi_folder, qvecs, avecs, threshold, cos_thr)
+    report = analyze(files, multi_folder, qvecs, avecs, threshold, cos_thr,
+                     (cfg or {}).get("review", {}))
 
     llm = None
     if cfg and not args.no_llm:
